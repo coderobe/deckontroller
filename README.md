@@ -5,7 +5,7 @@ over USB-C as a genuine Steam Deck Controller with full Steam Input support.
 
 **Supports both trackpads, gyro, all four rear grip buttons, rumble, and anything normal steam input does.**
 
-__Not a generic HID gamepad emulation.__
+*Not a generic HID gamepad emulation, primarily for use with Steam or other Steam Controller compatible software*
 
 **Warning:** This passes a bunch of USB traffic through directly between your host and the Steam Deck controller.
 I think at least for the regular Steam Controller and other Valve accessories, Steam may perform firmware updates and stuff like that.
@@ -29,11 +29,7 @@ tl;dr: If you want to compile this from source, this means you either need to ha
 
 ## Build
 
-```
-make
-```
-
-Produces `target/x86_64-unknown-linux-musl/release/deckontroller`. This binary can be copied to the steam deck.  
+`make` produces `target/x86_64-unknown-linux-musl/release/deckontroller`. This binary can be copied to the steam deck.  
 No additional runtime dependencies are required.
 
 ## Run
@@ -45,10 +41,9 @@ sudo ./deckontroller run
 Connect the Steam Deck to another computer with a usb cable and you should be good to go.
 Ctrl-C the program to return the controls to the Steam Deck, or `sudo ./deckontroller teardown`
 
-On the laptop side: open Steam, go to `Settings` -> `Controller` -> make
-sure "Steam Deck Controller" support is enabled (Valve's own controllers
-are recognized without needing the "Generic gamepad configuration
-support" toggle GadgetDeck-style software requires)
+On the computer side: open Steam, go to `Settings` -> `Controller` -> You should see "Steam Deck Controller (USB)" here.
+If not, make sure the various relevant controller support toggle is enabled in case anything is disabled for some reason.  
+(Valve's own controllers are recognized without needing the "Generic gamepad configuration support" toggle GadgetDeck-style software requires, though)
 
 Steam should just show it as a normal Deck controller now since as far as it can tell, that's exactly what it is.  
 If it does not show up under `Settings` -> `Controller`, make sure deckontroller has started without errors and the deck is connected to the computer. If it still does not show up, restart Steam on your computer.
@@ -57,9 +52,9 @@ If it does not show up under `Settings` -> `Controller`, make sure deckontroller
 ### If it doesn't enumerate
 
 1. `dmesg -w` on the Deck while running: the kernel logs why FunctionFS rejected a descriptor set, if it did.
-2. On the laptop, `lsusb -v` (Linux) or Device Manager (Windows) to see whether *anything* enumerated, and what VID/PID/class it reported.
+2. On the computer, `lsusb -v` (Linux) or Device Manager (Windows) to see whether *anything* enumerated, and what VID/PID/class it reported.
 
-   ### If the UDC is busy
+### If the UDC is busy
 
    The Deck exposes only one USB Device Controller, so it can host only one
    USB gadget at a time. If startup says that the UDC is already bound, another
@@ -75,7 +70,7 @@ If it does not show up under `Settings` -> `Controller`, make sure deckontroller
 
    If it still does not work, please open an issue report with as much information (deckontroller output, deck dmesg, host lsusb or device manager info, host system info, etc) as possible, and describe the issue you are having.
 
-## Info for macOS users
+## A note for macOS users
 The awesome project CrossPuck (https://github.com/scryner/crosspuck) can forward the deckontroller to Steam running in Wine or CrossOver if you patch the USB VID/PID it is looking for to be 28de:1205 Valve Software Steam Controller instead of the Steam Controller Puck and give it the right descriptor.  
 If there is demand for a pre-patched version of crosspuck, feel free to open an issue here.  
 
