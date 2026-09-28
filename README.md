@@ -76,7 +76,8 @@ If it does not show up under `Settings` -> `Controller`, make sure deckontroller
    If it still does not work, please open an issue report with as much information (deckontroller output, deck dmesg, host lsusb or device manager info, host system info, etc) as possible, and describe the issue you are having.
 
 ## Info for macOS users
-The awesome project CrossPuck (https://github.com/scryner/crosspuck) can forward the deckontroller to Steam running in Wine or CrossOver if you patch the USB VID/PID it is looking for to be 28de:1205 Valve Software Steam Controller instead of the Steam Controller Puck.
+The awesome project CrossPuck (https://github.com/scryner/crosspuck) can forward the deckontroller to Steam running in Wine or CrossOver if you patch the USB VID/PID it is looking for to be 28de:1205 Valve Software Steam Controller instead of the Steam Controller Puck and give it the right descriptor.  
+If there is demand for a pre-patched version of crosspuck, feel free to open an issue here.  
 
 ## Acknowledgements
 
