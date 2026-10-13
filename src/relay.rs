@@ -1232,27 +1232,29 @@ fn handle_setup(
     event_counter: &AtomicU64,
     req: SetupRequest,
 ) -> std::io::Result<()> {
+    // FunctionFS rewrites wIndex of interface-directed requests to a function-local interface number, used here as the index into `layout`
+    let index = usize::from(req.index & 0x00ff);
     trace(
         event_counter,
         &format!(
-            "setup: {}; raw=bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength={}",
+            "setup: {}; raw=bmRequestType=0x{:02x} bRequest=0x{:02x} wValue=0x{:04x} wIndex=0x{:04x} wLength={} (gadget interface {index}: {})",
             describe_setup_request(req),
             req.request_type,
             req.request,
             req.value,
             req.index,
-            req.length
+            req.length,
+            layout
+                .get(index)
+                .map_or_else(|| "none".to_owned(), |i| format!("{:?}", i.role)),
         ),
     );
 
-    // FunctionFS rewrites wIndex of interface-directed requests to the function-local interface number, which is the index into `layout`
-    let index = usize::from(req.index & 0x00ff);
     let Some(iface) = layout.get(index) else {
         ep0.stall(req.is_device_to_host())?;
         return Ok(());
     };
     let report_descriptor = &iface.report_descriptor[..];
-    // Only the vendor interface talks to the real controller; mouse and keyboard have no feature reports
     let is_vendor = iface.role == Role::Vendor;
 
     // The HID class descriptor, rebuilt from the same values advertised in the configuration descriptor
@@ -1307,10 +1309,24 @@ fn handle_setup(
     let report_id = (req.value & 0x00ff) as u8;
     let report_type = (req.value >> 8) as u8;
 
+    // Feature reports exist only on the vendor interface (the mouse and keyboard descriptors declare none), and the real
+    // controller is the only thing that can answer them, so they are forwarded whichever interface the host addressed.
+    // Rejecting them instead makes the host retry forever. If it addresses a different interface than the one the gadget
+    // advertises as the vendor interface, say so once, since that points at an interface numbering mismatch.
+    if report_type == HID_REPORT_TYPE_FEATURE && !is_vendor {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log(&format!(
+                "note: the host sent a feature report request to gadget interface {index} ({:?}), not the vendor interface; \
+                 forwarding it to the controller anyway",
+                iface.role
+            ));
+        }
+    }
+
     match req.request {
         HID_GET_REPORT
-            if is_vendor
-                && req.is_device_to_host()
+            if req.is_device_to_host()
                 && report_type == HID_REPORT_TYPE_FEATURE
                 && req.length != 0 =>
         {
@@ -1390,9 +1406,7 @@ fn handle_setup(
         {
             ep0.stall(req.is_device_to_host())?;
         }
-        HID_SET_REPORT
-            if is_vendor && !req.is_device_to_host() && report_type == HID_REPORT_TYPE_FEATURE =>
-        {
+        HID_SET_REPORT if !req.is_device_to_host() && report_type == HID_REPORT_TYPE_FEATURE => {
             let data = ep0.read_out(req.length as usize)?;
             let sequence = feature_trace.sequence();
             let command = data.first().copied().unwrap_or_default();
