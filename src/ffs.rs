@@ -9,6 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const FUNCTIONFS_DESCRIPTORS_MAGIC: u32 = 1;
 const FUNCTIONFS_STRINGS_MAGIC: u32 = 2;
@@ -431,8 +432,42 @@ impl EpIn {
                 .open(mount.join(format!("ep{number}")))?,
         })
     }
-    pub fn send(&mut self, report: &[u8]) -> io::Result<()> {
-        self.file.write_all(report)
+
+    #[cfg(test)]
+    pub fn from_file(file: File) -> Self {
+        EpIn { file }
+    }
+
+    /// Send one report. The write blocks until the host has polled it, which is the flow control for the whole relay.
+    ///
+    /// While the endpoint is disabled (host reconfiguring, cable pulled) FunctionFS makes the write wait until it is enabled again.
+    /// Such a wait ends with EINTR when the thread is signalled; `running` going false then turns that into an error
+    /// instead of retrying, so a stopping forwarder can never get stuck here.
+    pub fn send(&mut self, report: &[u8], running: &AtomicBool) -> io::Result<()> {
+        loop {
+            let written = unsafe {
+                libc::write(
+                    self.file.as_raw_fd(),
+                    report.as_ptr() as *const libc::c_void,
+                    report.len(),
+                )
+            };
+            if written >= 0 {
+                return if written as usize == report.len() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("short endpoint write: {written} of {} bytes", report.len()),
+                    ))
+                };
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted && running.load(Ordering::SeqCst) {
+                continue;
+            }
+            return Err(error);
+        }
     }
 }
 

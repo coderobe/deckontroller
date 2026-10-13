@@ -5,10 +5,11 @@
 
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ffs::{
     hid_descriptor, Ep0, Ep0Event, EpIn, InterfaceSpec, Role, SetupRequest, HID_GET_IDLE,
@@ -454,6 +455,115 @@ impl FeatureTrace {
     }
 }
 
+/// A running report-forwarding thread and the interface it serves
+struct Forwarder {
+    /// Index into the interface layout; its endpoint file is `ep{index + 1}`
+    index: usize,
+    handle: thread::JoinHandle<()>,
+}
+
+extern "C" fn interrupt_noop(_signal: libc::c_int) {}
+
+/// Install a do-nothing SIGUSR1 handler (without SA_RESTART). Signalling a forwarder thread with it makes a blocking
+/// syscall (an endpoint write waiting for the host) return EINTR, which is how `stop_forwarders` unblocks it.
+fn install_interrupt_handler() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = interrupt_noop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut());
+    });
+}
+
+fn spawn_forwarder(
+    index: usize,
+    spec: &InterfaceSpec,
+    mount: &std::path::Path,
+    running: &Arc<AtomicBool>,
+    event_counter: &Arc<AtomicU64>,
+    controller: &Arc<HidRaw>,
+    auxiliary: &Arc<SteamDeckAuxiliaryInterfaces>,
+) -> Forwarder {
+    // Endpoints are numbered in descriptor order, so interface i uses ep(i+1)
+    let ep_number = index + 1;
+    let running = running.clone();
+    let events = event_counter.clone();
+    let mount = mount.to_path_buf();
+    let handle = match spec.role {
+        Role::Vendor => {
+            let controller = controller.clone();
+            thread::spawn(move || {
+                if let Err(e) = forward_reports(&mount, ep_number, &controller, &running, &events) {
+                    log(&format!("report forwarder stopped: {e}"));
+                }
+            })
+        }
+        Role::Mouse => {
+            let auxiliary = auxiliary.clone();
+            thread::spawn(move || {
+                if let Err(e) =
+                    forward_mouse_reports(&mount, ep_number, &auxiliary.mouse, &running, &events)
+                {
+                    log(&format!("mouse report forwarder stopped: {e}"));
+                }
+            })
+        }
+        Role::Keyboard => {
+            let auxiliary = auxiliary.clone();
+            thread::spawn(move || {
+                if let Err(e) = forward_auxiliary_reports(
+                    "keyboard",
+                    &mount,
+                    ep_number,
+                    &auxiliary.keyboard,
+                    STEAM_DECK_KEYBOARD_REPORT_LENGTH,
+                    &running,
+                    &events,
+                ) {
+                    log(&format!("keyboard report forwarder stopped: {e}"));
+                }
+            })
+        }
+    };
+    Forwarder { index, handle }
+}
+
+/// Stop every forwarder and wait for it.
+///
+/// A forwarder can be blocked inside a FunctionFS endpoint write that is waiting for the endpoint to be enabled again,
+/// which a plain "running = false" never wakes. So unfinished threads are signalled (see `install_interrupt_handler`)
+/// until they return. A thread that still has not stopped after a couple of seconds is left behind rather than
+/// hanging the relay; it only sees its own `running` flag, so it cannot interfere with a later generation of forwarders.
+fn stop_forwarders(forwarders: &mut Vec<Forwarder>, running: &AtomicBool) {
+    running.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while forwarders.iter().any(|f| !f.handle.is_finished()) && Instant::now() < deadline {
+        for forwarder in forwarders.iter().filter(|f| !f.handle.is_finished()) {
+            // The handle has not been joined, so the pthread id is still valid
+            unsafe {
+                // pthread_t is an integer on glibc but a pointer on musl, which is why this is cast
+                libc::pthread_kill(
+                    forwarder.handle.as_pthread_t() as libc::pthread_t,
+                    libc::SIGUSR1,
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for forwarder in forwarders.drain(..) {
+        if forwarder.handle.is_finished() {
+            let _ = forwarder.handle.join();
+        } else {
+            log(&format!(
+                "forwarder for interface {} did not stop in time; leaving it behind",
+                forwarder.index
+            ));
+        }
+    }
+}
+
 pub fn run(
     controller: HidRaw,
     auxiliary: SteamDeckAuxiliaryInterfaces,
@@ -462,9 +572,11 @@ pub fn run(
     ep0: &mut Ep0,
     unbind: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let running = Arc::new(AtomicBool::new(false));
+    install_interrupt_handler();
+    // Every time forwarding starts it gets a fresh flag, so a forwarder that could not be stopped in time stays stopped
+    let mut running = Arc::new(AtomicBool::new(false));
     let event_counter = Arc::new(AtomicU64::new(0));
-    let mut input_forwarders: Vec<thread::JoinHandle<()>> = Vec::new();
+    let mut forwarders: Vec<Forwarder> = Vec::new();
     // This must stay alive for precisely the period in which we are sending reports to the USB host.
     // hidraw itself is non-exclusive; these evdev grabs try to prevent the same physical buttons reaching KDE/Steam locally.
     let mut _local_input_grab = None;
@@ -477,130 +589,188 @@ pub fn run(
     let auxiliary = Arc::new(auxiliary);
     // GET_PROTOCOL state per interface: 1 = report protocol for boot-capable interfaces; others never use it
     let mut protocols: Vec<u8> = layout.iter().map(|i| u8::from(i.subclass == 1)).collect();
+    // ENABLE events since the host last configured the gadget. FunctionFS sends one per interface of the function
+    // (and re-enables all endpoints each time), without saying which interface it was for.
+    let mut enables_seen = 0usize;
 
     let result = (|| -> std::io::Result<()> {
-    loop {
-        match ep0.next_event()? {
-            Ep0Event::Bind => trace(&event_counter, "FunctionFS Bind"),
-            Ep0Event::Unbind => trace(&event_counter, "FunctionFS Unbind"),
-            Ep0Event::Suspend => trace(&event_counter, "FunctionFS Suspend"),
-            Ep0Event::Resume => trace(&event_counter, "FunctionFS Resume"),
+        loop {
+            match ep0.next_event()? {
+                Ep0Event::Bind => trace(&event_counter, "FunctionFS Bind"),
+                Ep0Event::Unbind => {
+                    trace(&event_counter, "FunctionFS Unbind");
+                    enables_seen = 0;
+                }
+                Ep0Event::Suspend => trace(&event_counter, "FunctionFS Suspend"),
+                Ep0Event::Resume => trace(&event_counter, "FunctionFS Resume"),
 
-            Ep0Event::Enable => {
-                log("host configured gadget; starting controller forwarding");
-                trace(
-                    &event_counter,
-                    "FunctionFS Enable: host configured us, starting report forwarding",
-                );
-                // FunctionFS sends one ENABLE per interface the host sets up, and re-enables the endpoints each time,
-                // so a single configuration produces several of them in a row. Forwarders from the previous ENABLE
-                // may have lost their endpoint, so restart them every time, but grab the local input only once.
-                if !input_forwarders.is_empty() {
-                    running.store(false, Ordering::SeqCst);
-                    for h in input_forwarders.drain(..) {
-                        let _ = h.join();
-                    }
-                    trace(&event_counter, "FunctionFS Enable repeated: restarting report forwarding");
-                }
-                if _local_input_grab.is_none() {
-                    _local_input_grab = Some(crate::hid::EvdevGrabs::acquire(&controller)?);
-                    trace(&event_counter, "local controller input exclusively grabbed");
-                }
-                running.store(true, Ordering::SeqCst);
-                // One forwarder per interface; endpoints are numbered in descriptor order, so interface i uses ep(i+1)
-                for (index, spec) in layout.iter().enumerate() {
-                    let ep_number = index + 1;
-                    let thread_running = running.clone();
-                    let thread_events = event_counter.clone();
-                    let thread_mount = mount.to_path_buf();
-                    match spec.role {
-                        Role::Vendor => {
-                            let thread_controller = controller.clone();
-                            input_forwarders.push(thread::spawn(move || {
-                                if let Err(e) = forward_reports(
-                                    &thread_mount,
-                                    ep_number,
-                                    &thread_controller,
-                                    &thread_running,
-                                    &thread_events,
-                                ) {
-                                    log(&format!("report forwarder stopped: {e}"));
-                                }
-                            }));
+                Ep0Event::Enable => {
+                    enables_seen += 1;
+                    let total = layout.len();
+                    // The composite core configures interfaces in ascending order, so the n-th ENABLE of a configuration
+                    // belongs to interface n-1
+                    let which = match layout.get(enables_seen - 1) {
+                        Some(spec) => format!(
+                            "{enables_seen}/{total}: host configured interface {} ({:?})",
+                            enables_seen - 1,
+                            spec.role
+                        ),
+                        None => format!("#{enables_seen}: host re-selected an interface"),
+                    };
+
+                    if enables_seen == 1 {
+                        // All endpoints are already usable after the first ENABLE, so forwarding starts right away
+                        log("host configured gadget; starting controller forwarding");
+                        trace(
+                            &event_counter,
+                            &format!("FunctionFS Enable {which}; starting report forwarding"),
+                        );
+                        if _local_input_grab.is_none() {
+                            _local_input_grab = Some(crate::hid::EvdevGrabs::acquire(&controller)?);
+                            trace(&event_counter, "local controller input exclusively grabbed");
                         }
-                        Role::Mouse => {
-                            let thread_auxiliary = auxiliary.clone();
-                            input_forwarders.push(thread::spawn(move || {
-                                if let Err(e) = forward_mouse_reports(
-                                    &thread_mount,
-                                    ep_number,
-                                    &thread_auxiliary.mouse,
-                                    &thread_running,
-                                    &thread_events,
-                                ) {
-                                    log(&format!("mouse report forwarder stopped: {e}"));
-                                }
-                            }));
+                        running = Arc::new(AtomicBool::new(true));
+                        for (index, spec) in layout.iter().enumerate() {
+                            forwarders.push(spawn_forwarder(
+                                index,
+                                spec,
+                                mount,
+                                &running,
+                                &event_counter,
+                                &controller,
+                                &auxiliary,
+                            ));
                         }
-                        Role::Keyboard => {
-                            let thread_auxiliary = auxiliary.clone();
-                            input_forwarders.push(thread::spawn(move || {
-                                if let Err(e) = forward_auxiliary_reports(
-                                    "keyboard",
-                                    &thread_mount,
-                                    ep_number,
-                                    &thread_auxiliary.keyboard,
-                                    STEAM_DECK_KEYBOARD_REPORT_LENGTH,
-                                    &thread_running,
-                                    &thread_events,
-                                ) {
-                                    log(&format!("keyboard report forwarder stopped: {e}"));
-                                }
-                            }));
+                    } else {
+                        trace(
+                            &event_counter,
+                            &format!(
+                                "FunctionFS Enable {which}; endpoints were re-enabled, forwarding continues"
+                            ),
+                        );
+                        // Forwarders survive a re-enable (a write aborted by it is retried or dropped),
+                        // but start again any that gave up in the meantime
+                        for slot in forwarders.iter_mut() {
+                            if slot.handle.is_finished() {
+                                log(&format!(
+                                    "restarting stopped forwarder for interface {}",
+                                    slot.index
+                                ));
+                                let replacement = spawn_forwarder(
+                                    slot.index,
+                                    &layout[slot.index],
+                                    mount,
+                                    &running,
+                                    &event_counter,
+                                    &controller,
+                                    &auxiliary,
+                                );
+                                let old = std::mem::replace(slot, replacement);
+                                let _ = old.handle.join();
+                            }
                         }
                     }
                 }
-            }
 
-            Ep0Event::Disable => {
-                log("host deconfigured gadget; stopping controller forwarding");
-                trace(
-                    &event_counter,
-                    "FunctionFS Disable: host dropped configuration, stopping forwarding",
-                );
-                running.store(false, Ordering::SeqCst);
-                for h in input_forwarders.drain(..) {
-                    let _ = h.join();
+                Ep0Event::Disable => {
+                    log("host deconfigured gadget; stopping controller forwarding");
+                    trace(
+                        &event_counter,
+                        "FunctionFS Disable: host dropped configuration, stopping forwarding",
+                    );
+                    enables_seen = 0;
+                    stop_forwarders(&mut forwarders, &running);
+                    _local_input_grab = None;
+                    trace(&event_counter, "local controller input released");
                 }
-                _local_input_grab = None;
-                trace(&event_counter, "local controller input released");
-            }
 
-            Ep0Event::Setup(req) => handle_setup(
-                &mut *ep0,
-                &controller,
-                layout,
-                &mut protocols,
-                &mut feature_trace,
-                &event_counter,
-                req,
-            )?,
+                Ep0Event::Setup(req) => handle_setup(
+                    &mut *ep0,
+                    &controller,
+                    layout,
+                    &mut protocols,
+                    &mut feature_trace,
+                    &event_counter,
+                    req,
+                )?,
+            }
         }
-    }
     })();
 
     // However the loop ended (including errors), stop every forwarder before returning. They hold FunctionFS endpoint
     // files open, which keeps the mount busy and makes the caller's cleanup fail. Unbinding first aborts any
-    // endpoint write still waiting for the host, so the joins cannot hang on one.
+    // endpoint write still in flight.
     running.store(false, Ordering::SeqCst);
     if let Err(e) = unbind() {
         log(&format!("unbinding gadget while stopping forwarders failed: {e}"));
     }
-    for h in input_forwarders.drain(..) {
-        let _ = h.join();
-    }
+    stop_forwarders(&mut forwarders, &running);
     _local_input_grab = None;
     result
+}
+
+/// Throw away everything already waiting in a hidraw queue, returning how many reports were dropped.
+///
+/// hidraw keeps at most 63 reports per reader and, once full, drops the *newest* ones rather than the oldest.
+/// Nothing reads the queue while no host is configured, so by the time forwarding starts it is full of old input
+/// (a stale cursor movement or button state) that would otherwise be replayed, and it would stay that far behind.
+fn flush_pending(file: &mut std::fs::File) -> usize {
+    let mut scratch = [0u8; 256];
+    let mut dropped = 0;
+    // Bounded, so a device that never stops sending cannot trap the thread here
+    while dropped < 4096 && readable_now(file.as_raw_fd()).unwrap_or(false) {
+        match file.read(&mut scratch) {
+            Ok(n) if n > 0 => dropped += 1,
+            _ => break,
+        }
+    }
+    dropped
+}
+
+/// An endpoint write that fails like this was aborted because the host reconfigured the interface (or the link dropped)
+/// while the report was in flight. The relay stays up and a Disable/Enable event sorts out the rest.
+fn is_endpoint_reset(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ESHUTDOWN) | Some(libc::ECONNRESET)
+    )
+}
+
+/// Button/touch bits of a Steam Deck state report: header(4) + packet number(4), then the 64-bit button mask
+fn state_buttons(report: &[u8]) -> Option<[u8; 8]> {
+    const DECK_STATE_REPORT_TYPE: u8 = 9;
+    if report.len() >= 16 && report[2] == DECK_STATE_REPORT_TYPE {
+        report[8..16].try_into().ok()
+    } else {
+        None
+    }
+}
+
+/// Once this many vendor reports are waiting at the same time, the relay is clearly behind the controller
+const VENDOR_BACKLOG_THRESHOLD: usize = 4;
+
+/// When the host reads slower than the controller reports, reports pile up and every one of them is sent late: the lag
+/// never recovers because the consumer is not faster than the producer. Each vendor report carries the full controller
+/// state, so a backlog can be collapsed to its newest report. Reports where any button or touch bit changes, and anything that
+/// is not a state report, are kept, so no press or release is lost; only intermediate stick/pad/gyro samples are skipped.
+/// Below the threshold nothing is touched. `last_buttons` is the button mask of the last report already sent.
+fn thin_backlog(reports: Vec<Vec<u8>>, mut last_buttons: Option<[u8; 8]>) -> Vec<Vec<u8>> {
+    if reports.len() < VENDOR_BACKLOG_THRESHOLD {
+        return reports;
+    }
+    let newest = reports.len() - 1;
+    let mut kept = Vec::new();
+    for (i, report) in reports.into_iter().enumerate() {
+        let buttons = state_buttons(&report);
+        let keep = i == newest || buttons.is_none() || buttons != last_buttons;
+        if buttons.is_some() {
+            last_buttons = buttons;
+        }
+        if keep {
+            kept.push(report);
+        }
+    }
+    kept
 }
 
 /// Forward an exact physical keyboard report out the matching FunctionFS endpoint.
@@ -622,25 +792,38 @@ fn forward_auxiliary_reports(
     let mut hidg_write = EpIn::open(mount, ep_number)?;
     let mut buf = vec![0u8; report_length];
     let mut sequence = 0u64;
+    let stale = flush_pending(&mut hidraw_read);
+    if stale > 0 {
+        trace(
+            event_counter,
+            &format!("{name}: discarded {stale} stale report(s) queued before forwarding started"),
+        );
+    }
+    // A write aborted by an endpoint re-enable is sent again (a key release must not be lost), a few times at most
+    let mut unsent = false;
+    let mut retries = 0u8;
 
     while running.load(Ordering::SeqCst) {
-        if !wait_readable(hidraw_read.as_raw_fd(), running)? {
-            break;
+        if !unsent {
+            if !wait_readable(hidraw_read.as_raw_fd(), running)? {
+                break;
+            }
+            let n = hidraw_read.read(&mut buf)?;
+            if n == 0 {
+                continue;
+            }
+            if n != report_length {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "physical {name} hidraw report is {n} bytes; expected {report_length} bytes"
+                    ),
+                ));
+            }
+            sequence += 1;
         }
-        let n = hidraw_read.read(&mut buf)?;
-        if n == 0 {
-            continue;
-        }
-        if n != report_length {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "physical {name} hidraw report is {n} bytes; expected {report_length} bytes"
-                ),
-            ));
-        }
-        sequence += 1;
-        let log_report = should_log_interrupt(sequence);
+        let n = report_length;
+        let log_report = !unsent && should_log_interrupt(sequence);
         if log_report {
             trace(
                 event_counter,
@@ -650,12 +833,30 @@ fn forward_auxiliary_reports(
                 ),
             );
         }
-        match hidg_write.send(&buf) {
-            Ok(()) if log_report => trace(
-                event_counter,
-                &format!("{name} HID sequence={sequence}: HID gadget write completed result=ok"),
-            ),
-            Ok(()) => {}
+        match hidg_write.send(&buf, running) {
+            Ok(()) => {
+                unsent = false;
+                retries = 0;
+                if log_report {
+                    trace(
+                        event_counter,
+                        &format!("{name} HID sequence={sequence}: HID gadget write completed result=ok"),
+                    );
+                }
+            }
+            Err(error)
+                if is_endpoint_reset(&error) && running.load(Ordering::SeqCst) && retries < 3 =>
+            {
+                retries += 1;
+                unsent = true;
+                trace(
+                    event_counter,
+                    &format!(
+                        "{name} HID sequence={sequence}: write aborted by endpoint reset, retrying ({retries}/3)"
+                    ),
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             Err(error) => {
                 trace(
                     event_counter,
@@ -779,6 +980,14 @@ fn forward_mouse_reports(
         Ok(Some(buf))
     };
 
+    let stale = flush_pending(&mut hidraw_read);
+    if stale > 0 {
+        trace(
+            event_counter,
+            &format!("mouse: discarded {stale} stale report(s) queued before forwarding started"),
+        );
+    }
+
     let mut acc = MouseAccumulator::default();
     // A report whose button state differs from the batch being built: it starts the next batch,
     // so a quick press/release is never merged away.
@@ -829,7 +1038,17 @@ fn forward_mouse_reports(
                 ),
             );
         }
-        if let Err(error) = hidg_write.send(&report) {
+        if let Err(error) = hidg_write.send(&report, running) {
+            if is_endpoint_reset(&error) && running.load(Ordering::SeqCst) {
+                // Aborted by an endpoint re-enable: put the motion back so it goes out with the next report
+                acc.add(&report);
+                trace(
+                    event_counter,
+                    &format!("mouse HID sequence={sequence}: write aborted by endpoint reset, will resend"),
+                );
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             trace(
                 event_counter,
                 &format!(
@@ -851,6 +1070,9 @@ fn forward_reports(
     running: &AtomicBool,
     event_counter: &AtomicU64,
 ) -> std::io::Result<()> {
+    // Most reports a single read can leave behind; hidraw itself never queues more than 63
+    const MAX_DRAIN: usize = 64;
+
     let mut ep_in = EpIn::open(mount, ep_number)?;
     // duplicate the hidraw fd for blocking reads on this thread
     let raw_fd = unsafe { libc::dup(controller.file.as_raw_fd()) };
@@ -858,48 +1080,109 @@ fn forward_reports(
         return Err(std::io::Error::last_os_error());
     }
     let mut hidraw_read = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let fd = hidraw_read.as_raw_fd();
+
+    let stale = flush_pending(&mut hidraw_read);
+    if stale > 0 {
+        trace(
+            event_counter,
+            &format!("vendor: discarded {stale} stale report(s) queued before forwarding started"),
+        );
+    }
 
     let mut buf = [0u8; MAX_REPORT];
     let mut input_sequence = 0u64;
-    while running.load(Ordering::SeqCst) {
-        if !wait_readable(hidraw_read.as_raw_fd(), running)? {
+    let mut last_buttons: Option<[u8; 8]> = None;
+    let mut skipped_total = 0u64;
+    let mut batch: Vec<Vec<u8>> = Vec::new();
+    'forward: while running.load(Ordering::SeqCst) {
+        if !wait_readable(fd, running)? {
             break;
         }
+        batch.clear();
         let n = hidraw_read.read(&mut buf)?;
         if n == 0 {
             continue;
         }
-        input_sequence += 1;
-        let log_input = should_log_interrupt(input_sequence);
-        if log_input {
+        batch.push(buf[..n].to_vec());
+        // Pick up whatever queued up while the previous write was waiting for the host
+        while batch.len() < MAX_DRAIN && readable_now(fd)? {
+            let n = hidraw_read.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            batch.push(buf[..n].to_vec());
+        }
+        if batch.len() >= VENDOR_BACKLOG_THRESHOLD {
+            let before = batch.len();
+            batch = thin_backlog(std::mem::take(&mut batch), last_buttons);
+            skipped_total += (before - batch.len()) as u64;
             trace(
                 event_counter,
                 &format!(
-                    "interrupt IN sequence={input_sequence}: hidraw read succeeded len={n} ep1_len={n} unchanged=true {} bytes={}",
-                    describe_input_report(&buf[..n]),
-                    bounded_hex(&buf[..n])
+                    "vendor backlog of {before} report(s): sending {} (skipped {} stale state sample(s); total skipped {skipped_total})",
+                    batch.len(),
+                    before - batch.len()
                 ),
             );
-            trace(
-                event_counter,
-                &format!("interrupt IN sequence={input_sequence}: EP1 write started len={n}"),
-            );
         }
-        match ep_in.send(&buf[..n]) {
-            Ok(()) if log_input => trace(
-                event_counter,
-                &format!("interrupt IN sequence={input_sequence}: EP1 write completed result=ok"),
-            ),
-            Ok(()) => {}
-            Err(e) => {
+
+        for report in &batch {
+            input_sequence += 1;
+            let log_input = should_log_interrupt(input_sequence);
+            if log_input {
                 trace(
                     event_counter,
                     &format!(
-                        "interrupt IN sequence={input_sequence}: EP1 write failed errno={:?}: {e}",
-                        e.raw_os_error()
+                        "interrupt IN sequence={input_sequence}: hidraw read succeeded len={} ep{ep_number}_len={} unchanged=true {} bytes={}",
+                        report.len(),
+                        report.len(),
+                        describe_input_report(report),
+                        bounded_hex(report)
                     ),
                 );
-                break;
+                trace(
+                    event_counter,
+                    &format!(
+                        "interrupt IN sequence={input_sequence}: EP{ep_number} write started len={}",
+                        report.len()
+                    ),
+                );
+            }
+            match ep_in.send(report, running) {
+                Ok(()) => {
+                    if let Some(buttons) = state_buttons(report) {
+                        last_buttons = Some(buttons);
+                    }
+                    if log_input {
+                        trace(
+                            event_counter,
+                            &format!(
+                                "interrupt IN sequence={input_sequence}: EP{ep_number} write completed result=ok"
+                            ),
+                        );
+                    }
+                }
+                // A state report aborted by an endpoint re-enable is superseded by the next one
+                Err(e) if is_endpoint_reset(&e) && running.load(Ordering::SeqCst) => {
+                    trace(
+                        event_counter,
+                        &format!(
+                            "interrupt IN sequence={input_sequence}: EP{ep_number} write aborted by endpoint reset, dropped"
+                        ),
+                    );
+                    continue 'forward;
+                }
+                Err(e) => {
+                    trace(
+                        event_counter,
+                        &format!(
+                            "interrupt IN sequence={input_sequence}: EP{ep_number} write failed errno={:?}: {e}",
+                            e.raw_os_error()
+                        ),
+                    );
+                    break 'forward;
+                }
             }
         }
     }
@@ -1235,5 +1518,93 @@ mod tests {
         assert_eq!(a.take_report(), [1, 127, 0x81, 0, 0]);
         assert_eq!(a.take_report(), [1, 46, 0xd2, 0, 0]);
         assert!(!a.has_motion());
+    }
+
+    fn state(buttons: u8) -> Vec<u8> {
+        let mut r = vec![0u8; 64];
+        r[2] = 9; // Deck state report
+        r[8] = buttons;
+        r
+    }
+
+    #[test]
+    fn small_backlog_is_left_alone() {
+        let reports = vec![state(0), state(0), state(0)];
+        assert_eq!(thin_backlog(reports.clone(), Some([0; 8])), reports);
+    }
+
+    #[test]
+    fn large_backlog_collapses_to_newest_state() {
+        let reports: Vec<Vec<u8>> = (0..6).map(|_| state(0)).collect();
+        let kept = thin_backlog(reports, Some([0; 8]));
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn backlog_keeps_button_edges_and_other_report_types() {
+        let mut other = state(0);
+        other[2] = 4; // not a state report: always kept
+        let reports = vec![
+            state(0),
+            state(1), // press
+            state(1),
+            other.clone(),
+            state(0), // release
+            state(0),
+        ];
+        let kept = thin_backlog(reports, Some([0; 8]));
+        assert_eq!(kept, vec![state(1), other, state(0), state(0)]);
+    }
+
+    #[test]
+    fn button_change_against_last_sent_is_an_edge() {
+        let reports: Vec<Vec<u8>> = vec![state(2), state(2), state(2), state(2)];
+        let kept = thin_backlog(reports, Some([0; 8]));
+        // the first report differs from what was last sent, the newest is always kept
+        assert_eq!(kept, vec![state(2), state(2)]);
+    }
+
+    #[test]
+    fn stop_forwarders_unblocks_a_stuck_endpoint_write() {
+        install_interrupt_handler();
+        // A pipe nobody reads, already full: a write to it blocks like an endpoint write waiting for the host
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe {
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let chunk = [0u8; 4096];
+            while libc::write(fds[1], chunk.as_ptr() as *const libc::c_void, chunk.len()) > 0 {}
+            libc::fcntl(fds[1], libc::F_SETFL, flags);
+        }
+        let mut endpoint = EpIn::from_file(unsafe { std::fs::File::from_raw_fd(fds[1]) });
+        let running = Arc::new(AtomicBool::new(true));
+        let thread_running = running.clone();
+        let handle = thread::spawn(move || {
+            assert!(endpoint.send(&[0u8; 64], &thread_running).is_err());
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!handle.is_finished(), "the write should be blocked");
+
+        let mut forwarders = vec![Forwarder { index: 0, handle }];
+        let started = Instant::now();
+        stop_forwarders(&mut forwarders, &running);
+        assert!(forwarders.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        unsafe { libc::close(fds[0]) };
+    }
+
+    #[test]
+    fn flush_pending_discards_queued_reports() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for _ in 0..10 {
+            assert_eq!(unsafe { libc::write(fds[1], [1u8; 5].as_ptr() as *const libc::c_void, 5) }, 5);
+        }
+        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // a pipe merges small writes, so only check that nothing is left afterwards
+        assert!(flush_pending(&mut reader) >= 1);
+        assert!(!readable_now(reader.as_raw_fd()).unwrap());
+        unsafe { libc::close(fds[1]) };
     }
 }
