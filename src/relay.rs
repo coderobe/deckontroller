@@ -511,11 +511,9 @@ pub fn run(
                 let mouse_hidg = mouse_hidg.to_path_buf();
                 let mouse_events = event_counter.clone();
                 input_forwarders.push(thread::spawn(move || {
-                    if let Err(e) = forward_auxiliary_reports(
-                        "mouse",
+                    if let Err(e) = forward_mouse_reports(
                         &mouse_controller.mouse,
                         &mouse_hidg,
-                        STEAM_DECK_MOUSE_REPORT_LENGTH,
                         &mouse_running,
                         &mouse_events,
                     ) {
@@ -629,6 +627,177 @@ fn forward_auxiliary_reports(
                 );
                 return Err(error);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Accumulates relative-mouse reports (`[buttons, dx, dy, wheel, ac_pan]`, all deltas i8) so that
+/// several physical reports can be sent to the host as one equivalent report.
+#[derive(Default, Debug)]
+struct MouseAccumulator {
+    buttons: u8,
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    pan: i32,
+}
+
+impl MouseAccumulator {
+    fn add(&mut self, report: &[u8; STEAM_DECK_MOUSE_REPORT_LENGTH]) {
+        self.buttons = report[0];
+        self.dx += i32::from(report[1] as i8);
+        self.dy += i32::from(report[2] as i8);
+        self.wheel += i32::from(report[3] as i8);
+        self.pan += i32::from(report[4] as i8);
+    }
+
+    /// Motion that has not been sent to the host yet
+    fn has_motion(&self) -> bool {
+        self.dx != 0 || self.dy != 0 || self.wheel != 0 || self.pan != 0
+    }
+
+    /// Produce one report and subtract what it carries. The descriptor's logical range is -127..=127,
+    /// anything beyond that stays in the accumulator for the next report instead of being lost.
+    fn take_report(&mut self) -> [u8; STEAM_DECK_MOUSE_REPORT_LENGTH] {
+        fn take(v: &mut i32) -> u8 {
+            let c = (*v).clamp(-127, 127);
+            *v -= c;
+            c as i8 as u8
+        }
+        [
+            self.buttons,
+            take(&mut self.dx),
+            take(&mut self.dy),
+            take(&mut self.wheel),
+            take(&mut self.pan),
+        ]
+    }
+}
+
+/// Non-blocking readiness check (does not touch O_NONBLOCK, which is shared by every dup of the fd)
+fn readable_now(fd: i32) -> std::io::Result<bool> {
+    loop {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result > 0 {
+            if pollfd.revents & libc::POLLIN != 0 {
+                return Ok(true);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("poll returned unexpected events: 0x{:x}", pollfd.revents),
+            ));
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
+        }
+    }
+}
+
+/// Forward the physical mouse to the HID gadget, merging reports that pile up while a write is in flight.
+///
+/// The stock f_hid gadget advertises a 10ms full-speed interval and `write()` blocks until the host has polled
+/// the previous report, so it drains at ~100 reports/s. The Deck's trackpad-mouse produces reports faster than that,
+/// so forwarding them 1:1 builds a backlog (hidraw buffer + f_hid queue) and the pointer lags further and further behind the finger.
+/// Mouse reports are relative deltas, so reports that arrive while we wait can be summed into one without losing any motion.
+fn forward_mouse_reports(
+    source: &HidRaw,
+    hidg_device: &std::path::Path,
+    running: &AtomicBool,
+    event_counter: &AtomicU64,
+) -> std::io::Result<()> {
+    const LEN: usize = STEAM_DECK_MOUSE_REPORT_LENGTH;
+    let raw_fd = unsafe { libc::dup(source.file.as_raw_fd()) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut hidraw_read = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let mut hidg_write = std::fs::OpenOptions::new().write(true).open(hidg_device)?;
+    let fd = hidraw_read.as_raw_fd();
+
+    let read_report = |file: &mut std::fs::File| -> std::io::Result<Option<[u8; LEN]>> {
+        let mut buf = [0u8; LEN];
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if n != LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("physical mouse hidraw report is {n} bytes; expected {LEN} bytes"),
+            ));
+        }
+        Ok(Some(buf))
+    };
+
+    let mut acc = MouseAccumulator::default();
+    // A report whose button state differs from the batch being built: it starts the next batch,
+    // so a quick press/release is never merged away.
+    let mut held: Option<[u8; LEN]> = None;
+    let mut sequence = 0u64;
+    let mut merged_total = 0u64;
+
+    while running.load(Ordering::SeqCst) {
+        // Nothing buffered: block until the physical mouse sends something
+        if held.is_none() && !acc.has_motion() {
+            if !wait_readable(fd, running)? {
+                break;
+            }
+            match read_report(&mut hidraw_read)? {
+                Some(r) => held = Some(r),
+                None => continue,
+            }
+        }
+        let mut merged = 0u64;
+        if !acc.has_motion() {
+            if let Some(r) = held.take() {
+                acc.add(&r);
+                merged += 1;
+            }
+        }
+        // Pick up everything that queued up in the meantime
+        while held.is_none() && readable_now(fd)? {
+            match read_report(&mut hidraw_read)? {
+                Some(r) if r[0] == acc.buttons => {
+                    acc.add(&r);
+                    merged += 1;
+                }
+                Some(r) => held = Some(r),
+                None => break,
+            }
+        }
+
+        let report = acc.take_report();
+        sequence += 1;
+        merged_total += merged.saturating_sub(1);
+        let log_report = should_log_interrupt(sequence);
+        if log_report {
+            trace(
+                event_counter,
+                &format!(
+                    "mouse HID sequence={sequence}: merged {merged} physical report(s) (total coalesced away: {merged_total}); gadget write bytes={}",
+                    bounded_hex(&report)
+                ),
+            );
+        }
+        if let Err(error) = hidg_write.write_all(&report) {
+            trace(
+                event_counter,
+                &format!(
+                    "mouse HID sequence={sequence}: HID gadget write failed errno={:?}: {error}",
+                    error.raw_os_error()
+                ),
+            );
+            return Err(error);
         }
     }
     Ok(())
@@ -968,4 +1137,31 @@ fn bounded_hex(bytes: &[u8]) -> String {
 
 fn should_log_interrupt(sequence: u64) -> bool {
     sequence <= 4 || sequence.is_power_of_two()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mouse_motion_is_summed() {
+        let mut a = MouseAccumulator::default();
+        a.add(&[0, 3, 0xfe, 0, 0]);
+        a.add(&[0, 4, 0xfe, 1, 0]);
+        assert_eq!(a.take_report(), [0, 7, 0xfc, 1, 0]);
+        assert!(!a.has_motion());
+    }
+
+    #[test]
+    fn mouse_overflow_is_carried_not_lost() {
+        let mut a = MouseAccumulator::default();
+        for _ in 0..3 {
+            a.add(&[1, 100, 0x9c, 0, 0]); // +100, -100
+        }
+        assert_eq!(a.take_report(), [1, 127, 0x81, 0, 0]);
+        assert!(a.has_motion());
+        assert_eq!(a.take_report(), [1, 127, 0x81, 0, 0]);
+        assert_eq!(a.take_report(), [1, 46, 0xd2, 0, 0]);
+        assert!(!a.has_motion());
+    }
 }
