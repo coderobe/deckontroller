@@ -14,6 +14,7 @@ mod ffs;
 mod gadget;
 mod hid;
 mod relay;
+mod usbdesc;
 
 use std::env;
 use std::process::ExitCode;
@@ -104,18 +105,46 @@ fn run(want_pid: Option<u16>) -> std::io::Result<()> {
 
     gadget::ensure_libcomposite_loaded()?;
 
-    let product_id = controller.info.product as u16;
-    let vendor_id = controller.info.vendor as u16;
+    // Present the same USB identity as the physical device: bcdDevice, manufacturer, product and serial strings
+    let identity = hid::UsbIdentity::read(&controller)?;
+    eprintln!(
+        "[deckontroller] forwarding USB identity: {:04x}:{:04x} bcdDevice={} manufacturer={:?} product={:?} serial={:?} configuration={:?}",
+        identity.vendor_id,
+        identity.product_id,
+        identity
+            .bcd_device
+            .map_or_else(|| "unknown".to_owned(), |v| format!("0x{v:04x}")),
+        identity.manufacturer,
+        identity.product,
+        identity.serial,
+        identity.configuration,
+    );
 
-    let g = gadget::Gadget::create(vendor_id, product_id, "Steam Controller")?;
+    // ...and the same descriptor-level details: device class, bcdUSB, power, interface subclass/protocol, HID descriptor, endpoint
+    let profile = usbdesc::PhysicalProfile::read(&controller, &auxiliary);
+    verbose_log_profile(&profile);
 
-    let spec = ffs::HidInterfaceSpec {
-        report_descriptor: controller.report_descriptor.clone(),
-        interface_string_index: 1,
-    };
+    let g = gadget::Gadget::create(&identity, &profile)?;
 
-    let descriptors = ffs::build_descriptors_blob(&spec);
-    let strings = ffs::build_strings_blob("Steam Controller");
+    // Mouse, keyboard and vendor interfaces, in the physical device's interface order
+    let layout = build_layout(&controller, &auxiliary, &profile);
+    for (index, spec) in layout.iter().enumerate() {
+        eprintln!(
+            "[deckontroller] interface {index}: {:?} subclass={} protocol={} bcdHID=0x{:04x} country={} endpoint=0x{:02x} maxpacket={} interval={} string={:?}",
+            spec.role,
+            spec.subclass,
+            spec.protocol,
+            spec.bcd_hid,
+            spec.country_code,
+            spec.endpoint_address,
+            spec.max_packet,
+            spec.interval,
+            spec.string,
+        );
+    }
+
+    let descriptors = ffs::build_descriptors_blob(&layout);
+    let strings = ffs::build_strings_blob(&layout);
 
     // IMPORTANT PART I SPENT WAY TOO LONG DEBUGGING:
     // FunctionFS requires the EP0 file descriptor to remain open while the function is active.
@@ -156,40 +185,14 @@ fn run(want_pid: Option<u16>) -> std::io::Result<()> {
 
     eprintln!("[deckontroller] gadget bound, waiting for host to enumerate us...");
 
-    let (mouse_hidg, keyboard_hidg) = match g.hid_gadget_devices() {
-        Ok(devices) => devices,
-        Err(device_error) => {
-            let unbind_result = g.unbind_udc();
-            drop(ep0);
-            let teardown_result = g.teardown();
-            return match (unbind_result, teardown_result) {
-                (Ok(()), Ok(())) => Err(device_error),
-                (Err(unbind_error), Ok(())) => Err(std::io::Error::new(
-                    device_error.kind(),
-                    format!("{device_error}; unbinding also failed: {unbind_error}"),
-                )),
-                (Ok(()), Err(teardown_error)) => Err(std::io::Error::new(
-                    device_error.kind(),
-                    format!("{device_error}; cleanup also failed: {teardown_error}"),
-                )),
-                (Err(unbind_error), Err(teardown_error)) => Err(std::io::Error::new(
-                    device_error.kind(),
-                    format!(
-                        "{device_error}; unbinding also failed: {unbind_error}; cleanup also failed: {teardown_error}"
-                    ),
-                )),
-            };
-        }
-    };
-
     // Keep the sole EP0 handle alive for the entire lifetime of the gadget.
     let result = relay::run(
         controller,
         auxiliary,
         &g.ffs_mount,
-        &mouse_hidg,
-        &keyboard_hidg,
+        &layout,
         &mut ep0,
+        || g.unbind_udc(),
     );
 
     // Unbind while the descriptor-owning EP0 handle is still open, then close it before unmounting FunctionFS.
@@ -229,4 +232,65 @@ fn run(want_pid: Option<u16>) -> std::io::Result<()> {
 
         (Ok(()), Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn verbose_log_profile(profile: &usbdesc::PhysicalProfile) {
+    if verbose_enabled() {
+        eprintln!("[deckontroller] mirroring physical USB descriptors: {profile:#?}");
+    }
+}
+
+/// Describe the gadget's interfaces by copying every value from the physical device.
+/// They are ordered by the physical interface number so host-visible interface numbers match the real device
+/// (the real Deck uses mouse, keyboard, vendor); if the numbers can't be read that is also the default order.
+fn build_layout(
+    controller: &hid::HidRaw,
+    auxiliary: &hid::SteamDeckAuxiliaryInterfaces,
+    profile: &usbdesc::PhysicalProfile,
+) -> Vec<ffs::InterfaceSpec> {
+    let mut physical = vec![
+        (ffs::Role::Mouse, &auxiliary.mouse.report_descriptor, profile.mouse.as_ref()),
+        (ffs::Role::Keyboard, &auxiliary.keyboard.report_descriptor, profile.keyboard.as_ref()),
+        (ffs::Role::Vendor, &controller.report_descriptor, profile.vendor.as_ref()),
+    ];
+    if physical.iter().all(|(_, _, iface)| iface.is_some()) {
+        physical.sort_by_key(|(_, _, iface)| iface.map_or(u8::MAX, |i| i.number));
+    }
+
+    physical
+        .into_iter()
+        .enumerate()
+        .map(|(position, (role, report_descriptor, iface))| {
+            let mut spec = ffs::InterfaceSpec::with_defaults(role, report_descriptor.clone(), position);
+            let Some(iface) = iface else { return spec };
+            spec.subclass = iface.subclass;
+            spec.protocol = iface.protocol;
+            spec.string = iface.interface_string.clone();
+            if let Some(hid) = &iface.hid {
+                spec.bcd_hid = hid.bcd_hid;
+                spec.country_code = hid.country_code;
+            }
+            // Only interrupt IN endpoints are relayed
+            const INTERRUPT: u8 = 0x03;
+            if iface.endpoints.len() > 1 {
+                eprintln!(
+                    "[deckontroller] warning: physical {role:?} interface has {} endpoints; only its first interrupt IN endpoint is mirrored",
+                    iface.endpoints.len()
+                );
+            }
+            if let Some(ep) = iface
+                .endpoints
+                .iter()
+                .find(|e| e.address & 0x80 != 0 && e.attributes & 0x03 == INTERRUPT)
+            {
+                // The endpoint address is deliberately not copied: see InterfaceSpec::endpoint_address
+                // Packet size and interval are only meaningful to copy if the real link is full-speed like the gadget
+                if profile.full_speed {
+                    spec.max_packet = ep.max_packet_size.min(64);
+                    spec.interval = ep.interval;
+                }
+            }
+            spec
+        })
+        .collect()
 }

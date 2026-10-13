@@ -15,40 +15,92 @@ const FUNCTIONFS_STRINGS_MAGIC: u32 = 2;
 
 const USB_DT_INTERFACE: u8 = 0x04;
 const USB_DT_ENDPOINT: u8 = 0x05;
-const USB_DT_HID: u8 = 0x21;
+pub const USB_DT_HID: u8 = 0x21;
 
 const USB_CLASS_HID: u8 = 0x03;
 const USB_ENDPOINT_XFER_INT: u8 = 0x03;
 
-/// One instance of the physical vendor HID interface:
-/// one interrupt IN endpoint and a HID class descriptor pointing at the report descriptor bytes we copied from the real hardware
-pub struct HidInterfaceSpec {
-    pub report_descriptor: Vec<u8>,
-    pub interface_string_index: u8, // 1-based index into the strings block, 0 = none
+/// Which physical HID interface an exposed interface mirrors
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Mouse,
+    Keyboard,
+    /// The vendor "Steam Controller" interface: feature reports are forwarded to the real controller
+    Vendor,
 }
 
-fn interface_descriptor(num_endpoints: u8, iface_string: u8) -> Vec<u8> {
+/// One HID interface of the gadget: interface descriptor, HID class descriptor and one interrupt IN endpoint.
+/// All values are copied from the physical interface; `with_defaults` is only the fallback.
+#[derive(Debug, Clone)]
+pub struct InterfaceSpec {
+    pub role: Role,
+    pub report_descriptor: Vec<u8>,
+    /// iInterface string, None if the physical interface has none
+    pub string: Option<String>,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub bcd_hid: u16,
+    pub country_code: u8,
+    /// Label of the endpoint in the descriptors: must stay sequential (0x81, 0x82, ...) in interface order, because FunctionFS
+    /// numbers its endpoint files that way. The address the host actually sees is chosen by the UDC when the function binds.
+    pub endpoint_address: u8,
+    pub max_packet: u16,
+    pub interval: u8,
+}
+
+impl InterfaceSpec {
+    /// Built-in values, used for anything the physical descriptors didn't tell us.
+    /// `position` is the interface's index within the gadget (0-based), used to pick a default endpoint address.
+    pub fn with_defaults(role: Role, report_descriptor: Vec<u8>, position: usize) -> Self {
+        let (subclass, protocol) = match role {
+            Role::Mouse => (1, 2),
+            Role::Keyboard => (1, 1),
+            Role::Vendor => (0, 0),
+        };
+        InterfaceSpec {
+            role,
+            report_descriptor,
+            string: None,
+            subclass,
+            protocol,
+            bcd_hid: 0x0111,
+            country_code: 0,
+            endpoint_address: 0x81 + position as u8,
+            max_packet: 64,
+            interval: 1,
+        }
+    }
+}
+
+fn interface_descriptor(
+    number: u8,
+    num_endpoints: u8,
+    iface_string: u8,
+    subclass: u8,
+    protocol: u8,
+) -> Vec<u8> {
     vec![
         9,                // bLength
         USB_DT_INTERFACE, // bDescriptorType
-        0,                // bInterfaceNumber (FunctionFS renumbers as needed)
+        number,           // bInterfaceNumber: the function-local index; FunctionFS maps it to the real composite number
         0,                // bAlternateSetting
         num_endpoints,    // bNumEndpoints
         USB_CLASS_HID,    // bInterfaceClass
-        0x00,             // bInterfaceSubClass (no boot protocol)
-        0x00,             // bInterfaceProtocol
+        subclass,         // bInterfaceSubClass
+        protocol,         // bInterfaceProtocol
         iface_string,     // iInterface
     ]
 }
 
-fn hid_descriptor(report_len: u16) -> Vec<u8> {
+pub fn hid_descriptor(report_len: u16, bcd_hid: u16, country_code: u8) -> Vec<u8> {
+    let bcd = bcd_hid.to_le_bytes();
     let mut v = vec![
-        9,          // bLength
-        USB_DT_HID, // bDescriptorType
-        0x11, 0x01, // bcdHID = 1.11
-        0x00, // bCountryCode
-        0x01, // bNumDescriptors
-        0x22, // bDescriptorType (Report)
+        9,            // bLength
+        USB_DT_HID,   // bDescriptorType
+        bcd[0], bcd[1], // bcdHID
+        country_code, // bCountryCode
+        0x01,         // bNumDescriptors
+        0x22,         // bDescriptorType (Report)
     ];
     v.extend_from_slice(&report_len.to_le_bytes());
     v
@@ -66,24 +118,51 @@ fn endpoint_descriptor(address: u8, max_packet: u16, interval: u8) -> Vec<u8> {
     v
 }
 
-/// Build one speed's worth of descriptors (interface + HID + interrupt IN).
-/// `interval` is in the units that speed expects (ms for full-speed, 125us-log2 units for high-speed), see the call sites below.
-fn speed_descriptors(spec: &HidInterfaceSpec, max_packet: u16, interval: u8) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend(interface_descriptor(1, spec.interface_string_index));
-    out.extend(hid_descriptor(spec.report_descriptor.len() as u16));
-    out.extend(endpoint_descriptor(0x83, max_packet, interval)); // FunctionFS ep1, USB EP3 IN
-    out
+/// 1-based FunctionFS string index of each interface (0 = no string), in interface order
+pub fn string_indices(interfaces: &[InterfaceSpec]) -> Vec<u8> {
+    let mut next = 0u8;
+    interfaces
+        .iter()
+        .map(|i| {
+            if i.string.is_some() {
+                next += 1;
+                next
+            } else {
+                0
+            }
+        })
+        .collect()
 }
 
 /// Assemble the full-speed-only blob to write to ep0 as the first write().
+/// Interfaces appear in the order given, and so do their endpoints: FunctionFS exposes them as ep1, ep2, ...
 /// The physical composite exposes full-speed endpoints, and configfs caps this gadget at full speed before the UDC is bound.
-pub fn build_descriptors_blob(spec: &HidInterfaceSpec) -> Vec<u8> {
-    let fs = speed_descriptors(spec, 64, 1); // full-speed: 1ms poll
+pub fn build_descriptors_blob(interfaces: &[InterfaceSpec]) -> Vec<u8> {
+    let indices = string_indices(interfaces);
+    let mut fs = Vec::new();
+    for (number, (spec, string_index)) in interfaces.iter().zip(indices).enumerate() {
+        fs.extend(interface_descriptor(
+            number as u8,
+            1,
+            string_index,
+            spec.subclass,
+            spec.protocol,
+        ));
+        fs.extend(hid_descriptor(
+            spec.report_descriptor.len() as u16,
+            spec.bcd_hid,
+            spec.country_code,
+        ));
+        fs.extend(endpoint_descriptor(
+            spec.endpoint_address,
+            spec.max_packet,
+            spec.interval,
+        ));
+    }
 
     // V1 header: magic(4) + length(4) + fs_count(4) + hs_count(4).
-    // The descriptor counts describe entries rather than byte lengths.
-    const FS_COUNT: u32 = 3;
+    // The descriptor counts describe entries (interface + HID + endpoint per interface) rather than byte lengths.
+    let fs_count = 3 * interfaces.len() as u32;
     const HS_COUNT: u32 = 0;
     let header_len = 16u32;
     let total_len = header_len + fs.len() as u32;
@@ -91,22 +170,27 @@ pub fn build_descriptors_blob(spec: &HidInterfaceSpec) -> Vec<u8> {
     let mut blob = Vec::with_capacity(total_len as usize);
     blob.extend_from_slice(&FUNCTIONFS_DESCRIPTORS_MAGIC.to_le_bytes());
     blob.extend_from_slice(&total_len.to_le_bytes());
-    blob.extend_from_slice(&FS_COUNT.to_le_bytes());
+    blob.extend_from_slice(&fs_count.to_le_bytes());
     blob.extend_from_slice(&HS_COUNT.to_le_bytes());
     blob.extend_from_slice(&fs);
     blob
 }
 
-/// Second write() to ep0: the strings block.
-/// Register exactly one string (the interface name) in exactly one language (US English).
-pub fn build_strings_blob(interface_name: &str) -> Vec<u8> {
-    let mut str_bytes = interface_name.as_bytes().to_vec();
-    str_bytes.push(0); // NUL terminator
+/// Second write() to ep0: the strings block, one string per interface that has an iInterface, in US English.
+/// With no strings at all, a block with zero strings and zero languages is valid.
+pub fn build_strings_blob(interfaces: &[InterfaceSpec]) -> Vec<u8> {
+    let strings: Vec<&str> = interfaces.iter().filter_map(|i| i.string.as_deref()).collect();
 
-    let lang_id: u16 = 0x0409; // en-US
     let mut body = Vec::new();
-    body.extend_from_slice(&lang_id.to_le_bytes());
-    body.extend_from_slice(&str_bytes);
+    if !strings.is_empty() {
+        let lang_id: u16 = 0x0409; // en-US
+        body.extend_from_slice(&lang_id.to_le_bytes());
+        for string in &strings {
+            body.extend_from_slice(string.as_bytes());
+            body.push(0); // NUL terminator
+        }
+    }
+    let lang_count = u32::from(!strings.is_empty());
 
     let header_len = 16u32;
     let total_len = header_len + body.len() as u32;
@@ -114,8 +198,8 @@ pub fn build_strings_blob(interface_name: &str) -> Vec<u8> {
     let mut blob = Vec::with_capacity(total_len as usize);
     blob.extend_from_slice(&FUNCTIONFS_STRINGS_MAGIC.to_le_bytes());
     blob.extend_from_slice(&total_len.to_le_bytes());
-    blob.extend_from_slice(&1u32.to_le_bytes()); // str_count
-    blob.extend_from_slice(&1u32.to_le_bytes()); // lang_count
+    blob.extend_from_slice(&(strings.len() as u32).to_le_bytes()); // str_count
+    blob.extend_from_slice(&lang_count.to_le_bytes());
     blob.extend_from_slice(&body);
     blob
 }
@@ -339,14 +423,94 @@ pub struct EpIn {
     file: File,
 }
 impl EpIn {
-    pub fn open(mount: &std::path::Path) -> io::Result<Self> {
-        // FunctionFS numbers ep files by descriptor order.
-        // NOTE: This is the first and only endpoint descriptor, even though the USB address is 0x83
+    /// `number` is the 1-based FunctionFS endpoint file: endpoints are numbered in descriptor order
+    pub fn open(mount: &std::path::Path, number: usize) -> io::Result<Self> {
         Ok(EpIn {
-            file: OpenOptions::new().write(true).open(mount.join("ep1"))?,
+            file: OpenOptions::new()
+                .write(true)
+                .open(mount.join(format!("ep{number}")))?,
         })
     }
     pub fn send(&mut self, report: &[u8]) -> io::Result<()> {
         self.file.write_all(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(role: Role, position: usize) -> InterfaceSpec {
+        InterfaceSpec::with_defaults(role, vec![0u8; 10], position)
+    }
+
+    #[test]
+    fn descriptor_blob_carries_mirrored_values() {
+        let mut s = spec(Role::Vendor, 2);
+        s.subclass = 1;
+        s.protocol = 2;
+        s.bcd_hid = 0x0110;
+        s.country_code = 0x21;
+        s.endpoint_address = 0x83;
+        s.max_packet = 32;
+        s.interval = 4;
+        s.string = Some("Vendor".into());
+
+        let blob = build_descriptors_blob(&[s]);
+        let fs = &blob[16..]; // skip the V1 header
+        assert_eq!(fs[8], 1); // iInterface -> first string
+        assert_eq!(&fs[5..8], &[3, 1, 2]); // class HID, subclass, protocol
+        assert_eq!(&fs[11..14], &[0x10, 0x01, 0x21]); // bcdHID 1.10, country code
+        assert_eq!(&fs[18..25], &[7, 5, 0x83, 3, 32, 0, 4]); // endpoint
+    }
+
+    #[test]
+    fn interfaces_are_numbered_by_position() {
+        let blob = build_descriptors_blob(&[
+            spec(Role::Mouse, 0),
+            spec(Role::Keyboard, 1),
+            spec(Role::Vendor, 2),
+        ]);
+        let fs = &blob[16..];
+        assert_eq!([fs[2], fs[25 + 2], fs[50 + 2]], [0, 1, 2]); // bInterfaceNumber
+    }
+
+    #[test]
+    fn several_interfaces_keep_order_and_count() {
+        let blob = build_descriptors_blob(&[
+            spec(Role::Mouse, 0),
+            spec(Role::Keyboard, 1),
+            spec(Role::Vendor, 2),
+        ]);
+        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 9); // fs_count
+        let fs = &blob[16..];
+        // endpoint addresses appear in interface order: 25 bytes per interface
+        assert_eq!([fs[20], fs[25 + 20], fs[50 + 20]], [0x81, 0x82, 0x83]);
+        // mouse is boot mouse, keyboard boot keyboard by default
+        assert_eq!(&fs[6..8], &[1, 2]);
+        assert_eq!(&fs[25 + 6..25 + 8], &[1, 1]);
+    }
+
+    #[test]
+    fn strings_only_for_interfaces_that_have_one() {
+        let mut a = spec(Role::Mouse, 0);
+        let b = spec(Role::Keyboard, 1);
+        let mut c = spec(Role::Vendor, 2);
+        a.string = Some("A".into());
+        c.string = Some("CC".into());
+        let all = [a, b, c];
+        assert_eq!(string_indices(&all), vec![1, 0, 2]);
+        let blob = build_strings_blob(&all);
+        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 2); // str_count
+        assert_eq!(u32::from_le_bytes(blob[12..16].try_into().unwrap()), 1); // lang_count
+        assert_eq!(&blob[16..], &[0x09, 0x04, b'A', 0, b'C', b'C', 0]);
+    }
+
+    #[test]
+    fn no_strings_gives_empty_block() {
+        let blob = build_strings_blob(&[spec(Role::Vendor, 0)]);
+        assert_eq!(blob.len(), 16);
+        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(blob[12..16].try_into().unwrap()), 0);
     }
 }

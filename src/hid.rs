@@ -482,6 +482,25 @@ mod tests {
     }
 
     #[test]
+    fn reads_usb_identity_from_sysfs_files() {
+        let dir = std::env::temp_dir().join(format!("deckontroller-identity-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("bcdDevice"), "0300\n").unwrap();
+        fs::write(dir.join("manufacturer"), "Valve Software\n").unwrap();
+        fs::write(dir.join("product"), "Steam Controller\n").unwrap();
+        fs::write(dir.join("serial"), "ABC123\n").unwrap();
+        fs::write(dir.join("configuration"), "\n").unwrap(); // present but empty
+
+        let id = UsbIdentity::from_sysfs(&dir, 0x28de, 0x1205);
+        assert_eq!(id.bcd_device, Some(0x0300));
+        assert_eq!(id.manufacturer.as_deref(), Some("Valve Software"));
+        assert_eq!(id.product.as_deref(), Some("Steam Controller"));
+        assert_eq!(id.serial.as_deref(), Some("ABC123"));
+        assert_eq!(id.configuration, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn identifies_only_evdev_node_names() {
         assert!(is_event_node_name("event0"));
         assert!(is_event_node_name("event123"));
@@ -491,7 +510,7 @@ mod tests {
     }
 }
 
-fn usb_device_parent(hidraw: &HidRaw) -> io::Result<PathBuf> {
+pub(crate) fn usb_device_parent(hidraw: &HidRaw) -> io::Result<PathBuf> {
     let name = hidraw.path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "hidraw path has no file name")
     })?;
@@ -509,6 +528,85 @@ fn usb_device_parent(hidraw: &HidRaw) -> io::Result<PathBuf> {
                     hidraw.path.display()
                 ),
             ));
+        }
+    }
+}
+
+/// The USB identity of the physical controller, read from sysfs, so the gadget can present exactly the same device descriptor fields.
+/// Optional fields are `None` when the physical device does not provide that string descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbIdentity {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// `bcdDevice` (device release number), e.g. 0x0300
+    pub bcd_device: Option<u16>,
+    pub manufacturer: Option<String>,
+    pub product: Option<String>,
+    pub serial: Option<String>,
+    /// iConfiguration string of the active configuration
+    pub configuration: Option<String>,
+}
+
+impl UsbIdentity {
+    /// Read the identity of the USB device that owns `controller` (the vendor HID interface)
+    pub fn read(controller: &HidRaw) -> io::Result<Self> {
+        let usb_device = usb_device_parent(controller)?;
+        Ok(Self::from_sysfs(
+            &usb_device,
+            controller.info.vendor as u16,
+            controller.info.product as u16,
+        ))
+    }
+
+    fn from_sysfs(
+        usb_device: &Path,
+        vendor_id: u16,
+        product_id: u16,
+    ) -> Self {
+        UsbIdentity {
+            vendor_id,
+            product_id,
+            bcd_device: read_hex_u16(&usb_device.join("bcdDevice")),
+            manufacturer: read_sysfs_string(&usb_device.join("manufacturer")),
+            product: read_sysfs_string(&usb_device.join("product")),
+            serial: read_sysfs_string(&usb_device.join("serial")),
+            configuration: read_sysfs_string(&usb_device.join("configuration")),
+        }
+    }
+}
+
+/// iInterface string of the USB interface this hidraw node belongs to (None if the real interface has none)
+pub(crate) fn usb_interface_string(hidraw: &HidRaw) -> Option<String> {
+    read_sysfs_string(&usb_interface_dir(hidraw)?.join("interface"))
+}
+
+/// Non-empty, trimmed contents of a sysfs string attribute (None if missing or empty)
+fn read_sysfs_string(path: &Path) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim_end_matches(['\n', '\r', '\0']).trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+/// `bInterfaceNumber` of the USB interface this hidraw node belongs to
+pub(crate) fn usb_interface_number(hidraw: &HidRaw) -> Option<u8> {
+    let dir = usb_interface_dir(hidraw)?;
+    u8::from_str_radix(fs::read_to_string(dir.join("bInterfaceNumber")).ok()?.trim(), 16).ok()
+}
+
+/// The sysfs directory of the USB interface (`bInterfaceNumber` lives there) below which this hidraw node sits
+pub(crate) fn usb_interface_dir(hidraw: &HidRaw) -> Option<PathBuf> {
+    let name = hidraw.path.file_name()?;
+    let mut current = fs::canonicalize(Path::new("/sys/class/hidraw").join(name).join("device")).ok()?;
+    loop {
+        if current.join("bInterfaceNumber").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
         }
     }
 }

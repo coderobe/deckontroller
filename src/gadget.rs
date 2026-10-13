@@ -6,17 +6,23 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::hid::{
-    STEAM_DECK_KEYBOARD_REPORT_DESCRIPTOR, STEAM_DECK_KEYBOARD_REPORT_LENGTH,
-    STEAM_DECK_MOUSE_REPORT_DESCRIPTOR, STEAM_DECK_MOUSE_REPORT_LENGTH,
-};
+use crate::hid::UsbIdentity;
+use crate::usbdesc::PhysicalProfile;
 
 const CONFIGFS_ROOT: &str = "/sys/kernel/config/usb_gadget";
 const GADGET_NAME: &str = "steamdeck_passthrough";
 const FUNCTION_NAME: &str = "steamdeck"; // -> functions/ffs.steamdeck, mount source "steamdeck"
-const MOUSE_FUNCTION_NAME: &str = "mouse";
-const KEYBOARD_FUNCTION_NAME: &str = "keyboard";
-const ACM_FUNCTION_NAME: &str = "GS0";
+
+// Functions that older versions added next to the FunctionFS one (stock f_hid for mouse and keyboard, plus a CDC ACM serial port).
+// The gadget no longer creates them; teardown still removes them so a gadget left behind by an older build can be cleaned up.
+const LEGACY_MOUSE_FUNCTION_NAME: &str = "mouse";
+const LEGACY_KEYBOARD_FUNCTION_NAME: &str = "keyboard";
+const LEGACY_ACM_FUNCTION_NAME: &str = "GS0";
+
+// Only used when the physical device doesn't report the field
+const FALLBACK_BCD_DEVICE: u16 = 0x0100;
+const FALLBACK_MANUFACTURER: &str = "Valve Software";
+const FALLBACK_PRODUCT: &str = "Steam Controller";
 
 pub struct Gadget {
     pub root: PathBuf,
@@ -36,63 +42,6 @@ fn write_file(path: impl AsRef<Path>, contents: &str) -> io::Result<()> {
             )
         })?;
     f.write_all(contents.as_bytes())
-}
-
-fn write_bytes_file(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
-    log(&format!("writing {}", path.as_ref().display()));
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("writing {}: {e}", path.as_ref().display()),
-            )
-        })?;
-    f.write_all(contents)
-}
-
-fn create_hid_function(
-    root: &Path,
-    name: &str,
-    subclass: u8,
-    protocol: u8,
-    report_length: usize,
-    report_descriptor: &[u8],
-) -> io::Result<PathBuf> {
-    let function = root.join(format!("functions/hid.{name}"));
-    create_dir_all(&function)?;
-    write_file(function.join("subclass"), &format!("{subclass}\n"))?;
-    write_file(function.join("protocol"), &format!("{protocol}\n"))?;
-    write_file(
-        function.join("report_length"),
-        &format!("{report_length}\n"),
-    )?;
-    write_bytes_file(function.join("report_desc"), report_descriptor)?;
-    Ok(function)
-}
-
-fn hid_gadget_device_path(function: &Path) -> io::Result<PathBuf> {
-    let device_number = fs::read_to_string(function.join("dev"))?;
-    let uevent = fs::read_to_string(
-        Path::new("/sys/dev/char")
-            .join(device_number.trim())
-            .join("uevent"),
-    )?;
-    let devname = uevent
-        .lines()
-        .find_map(|line| line.strip_prefix("DEVNAME="))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "kernel did not provide DEVNAME for HID gadget function {}",
-                    function.display()
-                ),
-            )
-        })?;
-    Ok(Path::new("/dev").join(devname))
 }
 
 fn link_function(function: &Path, config: &Path, name: &str) -> io::Result<()> {
@@ -117,7 +66,7 @@ impl Gadget {
     /// Idempotent: safe to call even if a previous run left the gadget half-configured.
     /// Returns once configfs + the ffs mount are ready;
     /// NOTE: the caller still has to write descriptors to ep0 *before* calling `bind_udc`
-    pub fn create(id_vendor: u16, id_product: u16, product_name: &str) -> io::Result<Self> {
+    pub fn create(identity: &UsbIdentity, profile: &PhysicalProfile) -> io::Result<Self> {
         let root = PathBuf::from(CONFIGFS_ROOT).join(GADGET_NAME);
         let ffs_mount = PathBuf::from("/dev/deckontroller-ffs");
 
@@ -128,54 +77,77 @@ impl Gadget {
 
         log("creating USB gadget configuration");
         create_dir_all(&root)?;
-        write_file(root.join("idVendor"), &format!("0x{id_vendor:04x}\n"))?;
-        write_file(root.join("idProduct"), &format!("0x{id_product:04x}\n"))?;
-        write_file(root.join("bcdDevice"), "0x0100\n")?;
-        write_file(root.join("bcdUSB"), "0x0200\n")?;
+        write_file(root.join("idVendor"), &format!("0x{:04x}\n", identity.vendor_id))?;
+        write_file(root.join("idProduct"), &format!("0x{:04x}\n", identity.product_id))?;
+        write_file(
+            root.join("bcdDevice"),
+            &format!("0x{:04x}\n", identity.bcd_device.unwrap_or(FALLBACK_BCD_DEVICE)),
+        )?;
+        write_file(
+            root.join("bcdUSB"),
+            &format!(
+                "0x{:04x}\n",
+                profile.device.as_ref().map_or(0x0200, |d| d.bcd_usb)
+            ),
+        )?;
+        if let Some(device) = &profile.device {
+            write_file(root.join("bDeviceClass"), &format!("0x{:02x}\n", device.class))?;
+            write_file(
+                root.join("bDeviceSubClass"),
+                &format!("0x{:02x}\n", device.subclass),
+            )?;
+            write_file(
+                root.join("bDeviceProtocol"),
+                &format!("0x{:02x}\n", device.protocol),
+            )?;
+            // The UDC may refuse sizes it can't do; it only accepts the values a real device would use
+            if let Err(e) = write_file(
+                root.join("bMaxPacketSize0"),
+                &format!("0x{:02x}\n", device.max_packet_size0),
+            ) {
+                log(&format!("could not set bMaxPacketSize0, keeping default: {e}"));
+            }
+        }
         write_file(root.join("max_speed"), "full-speed\n")?;
 
+        // Forward the physical device's string descriptors; a string the real device doesn't have is left unset
         let strings = root.join("strings/0x409");
         create_dir_all(&strings)?;
-        write_file(strings.join("manufacturer"), "Valve\n")?;
-        write_file(strings.join("product"), &format!("{product_name}\n"))?;
-        write_file(strings.join("serialnumber"), "0123456789\n")?;
+        write_file(
+            strings.join("manufacturer"),
+            &format!(
+                "{}\n",
+                identity.manufacturer.as_deref().unwrap_or(FALLBACK_MANUFACTURER)
+            ),
+        )?;
+        write_file(
+            strings.join("product"),
+            &format!("{}\n", identity.product.as_deref().unwrap_or(FALLBACK_PRODUCT)),
+        )?;
+        if let Some(serial) = &identity.serial {
+            write_file(strings.join("serialnumber"), &format!("{serial}\n"))?;
+        }
 
         let config = root.join("configs/c.1");
         create_dir_all(&config)?;
-        // configfs expresses MaxPower directly in milliamps. 500 sounds good to me.
-        write_file(config.join("MaxPower"), "500\n")?;
-        write_file(config.join("bmAttributes"), "0x80\n")?;
-        let config_strings = config.join("strings/0x409");
-        create_dir_all(&config_strings)?;
-        write_file(config_strings.join("configuration"), "Steam Controller\n")?;
+        // configfs expresses MaxPower directly in milliamps
+        let (max_power_ma, attributes) = profile
+            .config
+            .as_ref()
+            .map_or((500, 0x80), |c| (c.max_power_ma, c.attributes));
+        write_file(config.join("MaxPower"), &format!("{max_power_ma}\n"))?;
+        write_file(config.join("bmAttributes"), &format!("0x{attributes:02x}\n"))?;
+        if let Some(configuration) = &identity.configuration {
+            let config_strings = config.join("strings/0x409");
+            create_dir_all(&config_strings)?;
+            write_file(config_strings.join("configuration"), &format!("{configuration}\n"))?;
+        }
 
-        let mouse = create_hid_function(
-            &root,
-            MOUSE_FUNCTION_NAME,
-            0,
-            2,
-            STEAM_DECK_MOUSE_REPORT_LENGTH,
-            STEAM_DECK_MOUSE_REPORT_DESCRIPTOR,
-        )?;
-        let keyboard = create_hid_function(
-            &root,
-            KEYBOARD_FUNCTION_NAME,
-            1,
-            1,
-            STEAM_DECK_KEYBOARD_REPORT_LENGTH,
-            STEAM_DECK_KEYBOARD_REPORT_DESCRIPTOR,
-        )?;
+        // One FunctionFS function carries every interface (mouse, keyboard, vendor HID), so their descriptors can be copied
+        // from the physical device exactly. Interface order and endpoint allocation follow the order in its descriptors blob.
         let function = root.join(format!("functions/ffs.{FUNCTION_NAME}"));
         create_dir_all(&function)?;
-        let acm = root.join(format!("functions/acm.{ACM_FUNCTION_NAME}"));
-        create_dir_all(&acm)?;
-
-        // Function link order determines the composite interface order and endpoint allocation:
-        // mouse, keyboard, vendor HID, then CDC ACM.
-        link_function(&mouse, &config, &format!("hid.{MOUSE_FUNCTION_NAME}"))?;
-        link_function(&keyboard, &config, &format!("hid.{KEYBOARD_FUNCTION_NAME}"))?;
         link_function(&function, &config, &format!("ffs.{FUNCTION_NAME}"))?;
-        link_function(&acm, &config, &format!("acm.{ACM_FUNCTION_NAME}"))?;
 
         create_dir_all(&ffs_mount)?;
         log("mounting FunctionFS");
@@ -221,22 +193,6 @@ impl Gadget {
         }
     }
 
-    /// HID gadget character devices are allocated only once the configuration is active,
-    /// so this must be called after a successful UDC bind
-    pub fn hid_gadget_devices(&self) -> io::Result<(PathBuf, PathBuf)> {
-        let mouse = hid_gadget_device_path(
-            &self
-                .root
-                .join(format!("functions/hid.{MOUSE_FUNCTION_NAME}")),
-        )?;
-        let keyboard = hid_gadget_device_path(
-            &self
-                .root
-                .join(format!("functions/hid.{KEYBOARD_FUNCTION_NAME}")),
-        )?;
-        Ok((mouse, keyboard))
-    }
-
     /// Verify that FunctionFS accepted ep0's descriptor and string blocks before making the gadget visible to the USB host.
     pub fn wait_ready(&self) -> io::Result<()> {
         let ready = self
@@ -257,9 +213,12 @@ impl Gadget {
         }
     }
 
-    #[allow(dead_code)] // exposed for callers that want a clean unbind without a full teardown (for future use (tm))
+    /// Idempotent: unbinding a gadget that is already unbound (ENODEV) is not an error
     pub fn unbind_udc(&self) -> io::Result<()> {
-        write_file(self.root.join("UDC"), "\n")
+        match write_file(self.root.join("UDC"), "\n") {
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => Ok(()),
+            other => other,
+        }
     }
 
     pub fn teardown(&self) -> io::Result<()> {
@@ -301,16 +260,16 @@ impl Gadget {
         }
 
         let config = root.join("configs/c.1");
-        remove_file_if_exists(&config.join(format!("acm.{ACM_FUNCTION_NAME}")))?;
+        remove_file_if_exists(&config.join(format!("acm.{LEGACY_ACM_FUNCTION_NAME}")))?;
         remove_file_if_exists(&config.join(format!("ffs.{FUNCTION_NAME}")))?;
-        remove_file_if_exists(&config.join(format!("hid.{KEYBOARD_FUNCTION_NAME}")))?;
-        remove_file_if_exists(&config.join(format!("hid.{MOUSE_FUNCTION_NAME}")))?;
+        remove_file_if_exists(&config.join(format!("hid.{LEGACY_KEYBOARD_FUNCTION_NAME}")))?;
+        remove_file_if_exists(&config.join(format!("hid.{LEGACY_MOUSE_FUNCTION_NAME}")))?;
         remove_dir_if_exists(&config.join("strings/0x409"))?;
         remove_dir_if_exists(&config)?;
-        remove_dir_if_exists(&root.join(format!("functions/acm.{ACM_FUNCTION_NAME}")))?;
+        remove_dir_if_exists(&root.join(format!("functions/acm.{LEGACY_ACM_FUNCTION_NAME}")))?;
         remove_dir_if_exists(&root.join(format!("functions/ffs.{FUNCTION_NAME}")))?;
-        remove_dir_if_exists(&root.join(format!("functions/hid.{KEYBOARD_FUNCTION_NAME}")))?;
-        remove_dir_if_exists(&root.join(format!("functions/hid.{MOUSE_FUNCTION_NAME}")))?;
+        remove_dir_if_exists(&root.join(format!("functions/hid.{LEGACY_KEYBOARD_FUNCTION_NAME}")))?;
+        remove_dir_if_exists(&root.join(format!("functions/hid.{LEGACY_MOUSE_FUNCTION_NAME}")))?;
         remove_dir_if_exists(&root.join("strings/0x409"))?;
         remove_dir_if_exists(root)?;
         remove_dir_if_exists(ffs_mount)?;

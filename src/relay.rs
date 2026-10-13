@@ -3,7 +3,7 @@
 //! every control transfer the host sends goes to the real controller unchanged.
 //! straight pass-through lets Steam on the host handle everything rather than exposing a limited xinput hid device ourselves
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -11,8 +11,9 @@ use std::thread;
 use std::time::Instant;
 
 use crate::ffs::{
-    Ep0, Ep0Event, EpIn, SetupRequest, HID_GET_IDLE, HID_GET_PROTOCOL, HID_GET_REPORT,
-    HID_SET_IDLE, HID_SET_PROTOCOL, HID_SET_REPORT, USB_DT_REPORT, USB_GET_DESCRIPTOR,
+    hid_descriptor, Ep0, Ep0Event, EpIn, InterfaceSpec, Role, SetupRequest, HID_GET_IDLE,
+    HID_GET_PROTOCOL, HID_GET_REPORT, HID_SET_IDLE, HID_SET_PROTOCOL, HID_SET_REPORT, USB_DT_HID,
+    USB_DT_REPORT, USB_GET_DESCRIPTOR,
 };
 use crate::hid::{
     HidRaw, SteamDeckAuxiliaryInterfaces, STEAM_DECK_KEYBOARD_REPORT_LENGTH,
@@ -457,13 +458,13 @@ pub fn run(
     controller: HidRaw,
     auxiliary: SteamDeckAuxiliaryInterfaces,
     mount: &std::path::Path,
-    mouse_hidg: &std::path::Path,
-    keyboard_hidg: &std::path::Path,
+    layout: &[InterfaceSpec],
     ep0: &mut Ep0,
+    unbind: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let running = Arc::new(AtomicBool::new(false));
     let event_counter = Arc::new(AtomicU64::new(0));
-    let mut input_forwarders = Vec::new();
+    let mut input_forwarders: Vec<thread::JoinHandle<()>> = Vec::new();
     // This must stay alive for precisely the period in which we are sending reports to the USB host.
     // hidraw itself is non-exclusive; these evdev grabs try to prevent the same physical buttons reaching KDE/Steam locally.
     let mut _local_input_grab = None;
@@ -474,7 +475,10 @@ pub fn run(
     };
     let controller = Arc::new(controller);
     let auxiliary = Arc::new(auxiliary);
+    // GET_PROTOCOL state per interface: 1 = report protocol for boot-capable interfaces; others never use it
+    let mut protocols: Vec<u8> = layout.iter().map(|i| u8::from(i.subclass == 1)).collect();
 
+    let result = (|| -> std::io::Result<()> {
     loop {
         match ep0.next_event()? {
             Ep0Event::Bind => trace(&event_counter, "FunctionFS Bind"),
@@ -488,55 +492,74 @@ pub fn run(
                     &event_counter,
                     "FunctionFS Enable: host configured us, starting report forwarding",
                 );
-                _local_input_grab = Some(crate::hid::EvdevGrabs::acquire(&controller)?);
-                trace(&event_counter, "local controller input exclusively grabbed");
+                // FunctionFS sends one ENABLE per interface the host sets up, and re-enables the endpoints each time,
+                // so a single configuration produces several of them in a row. Forwarders from the previous ENABLE
+                // may have lost their endpoint, so restart them every time, but grab the local input only once.
+                if !input_forwarders.is_empty() {
+                    running.store(false, Ordering::SeqCst);
+                    for h in input_forwarders.drain(..) {
+                        let _ = h.join();
+                    }
+                    trace(&event_counter, "FunctionFS Enable repeated: restarting report forwarding");
+                }
+                if _local_input_grab.is_none() {
+                    _local_input_grab = Some(crate::hid::EvdevGrabs::acquire(&controller)?);
+                    trace(&event_counter, "local controller input exclusively grabbed");
+                }
                 running.store(true, Ordering::SeqCst);
-                let input_running = running.clone();
-                let input_controller = controller.clone();
-                let input_mount = mount.to_path_buf();
-                let input_events = event_counter.clone();
-                input_forwarders.push(thread::spawn(move || {
-                    if let Err(e) = forward_reports(
-                        &input_mount,
-                        &input_controller,
-                        &input_running,
-                        &input_events,
-                    ) {
-                        log(&format!("report forwarder stopped: {e}"));
+                // One forwarder per interface; endpoints are numbered in descriptor order, so interface i uses ep(i+1)
+                for (index, spec) in layout.iter().enumerate() {
+                    let ep_number = index + 1;
+                    let thread_running = running.clone();
+                    let thread_events = event_counter.clone();
+                    let thread_mount = mount.to_path_buf();
+                    match spec.role {
+                        Role::Vendor => {
+                            let thread_controller = controller.clone();
+                            input_forwarders.push(thread::spawn(move || {
+                                if let Err(e) = forward_reports(
+                                    &thread_mount,
+                                    ep_number,
+                                    &thread_controller,
+                                    &thread_running,
+                                    &thread_events,
+                                ) {
+                                    log(&format!("report forwarder stopped: {e}"));
+                                }
+                            }));
+                        }
+                        Role::Mouse => {
+                            let thread_auxiliary = auxiliary.clone();
+                            input_forwarders.push(thread::spawn(move || {
+                                if let Err(e) = forward_mouse_reports(
+                                    &thread_mount,
+                                    ep_number,
+                                    &thread_auxiliary.mouse,
+                                    &thread_running,
+                                    &thread_events,
+                                ) {
+                                    log(&format!("mouse report forwarder stopped: {e}"));
+                                }
+                            }));
+                        }
+                        Role::Keyboard => {
+                            let thread_auxiliary = auxiliary.clone();
+                            input_forwarders.push(thread::spawn(move || {
+                                if let Err(e) = forward_auxiliary_reports(
+                                    "keyboard",
+                                    &thread_mount,
+                                    ep_number,
+                                    &thread_auxiliary.keyboard,
+                                    STEAM_DECK_KEYBOARD_REPORT_LENGTH,
+                                    &thread_running,
+                                    &thread_events,
+                                ) {
+                                    log(&format!("keyboard report forwarder stopped: {e}"));
+                                }
+                            }));
+                        }
                     }
-                }));
-
-                let mouse_running = running.clone();
-                let mouse_controller = auxiliary.clone();
-                let mouse_hidg = mouse_hidg.to_path_buf();
-                let mouse_events = event_counter.clone();
-                input_forwarders.push(thread::spawn(move || {
-                    if let Err(e) = forward_mouse_reports(
-                        &mouse_controller.mouse,
-                        &mouse_hidg,
-                        &mouse_running,
-                        &mouse_events,
-                    ) {
-                        log(&format!("mouse report forwarder stopped: {e}"));
-                    }
-                }));
-
-                let keyboard_running = running.clone();
-                let keyboard_controller = auxiliary.clone();
-                let keyboard_hidg = keyboard_hidg.to_path_buf();
-                let keyboard_events = event_counter.clone();
-                input_forwarders.push(thread::spawn(move || {
-                    if let Err(e) = forward_auxiliary_reports(
-                        "keyboard",
-                        &keyboard_controller.keyboard,
-                        &keyboard_hidg,
-                        STEAM_DECK_KEYBOARD_REPORT_LENGTH,
-                        &keyboard_running,
-                        &keyboard_events,
-                    ) {
-                        log(&format!("keyboard report forwarder stopped: {e}"));
-                    }
-                }));
+                }
             }
 
             Ep0Event::Disable => {
@@ -556,21 +579,37 @@ pub fn run(
             Ep0Event::Setup(req) => handle_setup(
                 &mut *ep0,
                 &controller,
-                &controller.report_descriptor,
+                layout,
+                &mut protocols,
                 &mut feature_trace,
                 &event_counter,
                 req,
             )?,
         }
     }
+    })();
+
+    // However the loop ended (including errors), stop every forwarder before returning. They hold FunctionFS endpoint
+    // files open, which keeps the mount busy and makes the caller's cleanup fail. Unbinding first aborts any
+    // endpoint write still waiting for the host, so the joins cannot hang on one.
+    running.store(false, Ordering::SeqCst);
+    if let Err(e) = unbind() {
+        log(&format!("unbinding gadget while stopping forwarders failed: {e}"));
+    }
+    for h in input_forwarders.drain(..) {
+        let _ = h.join();
+    }
+    _local_input_grab = None;
+    result
 }
 
-/// Forward an exact physical mouse or keyboard report to the matching configfs HID gadget character device.
+/// Forward an exact physical keyboard report out the matching FunctionFS endpoint.
 /// The descriptors were length matched before the relay starts
 fn forward_auxiliary_reports(
     name: &str,
+    mount: &std::path::Path,
+    ep_number: usize,
     source: &HidRaw,
-    hidg_device: &std::path::Path,
     report_length: usize,
     running: &AtomicBool,
     event_counter: &AtomicU64,
@@ -580,7 +619,7 @@ fn forward_auxiliary_reports(
         return Err(std::io::Error::last_os_error());
     }
     let mut hidraw_read = unsafe { std::fs::File::from_raw_fd(raw_fd) };
-    let mut hidg_write = std::fs::OpenOptions::new().write(true).open(hidg_device)?;
+    let mut hidg_write = EpIn::open(mount, ep_number)?;
     let mut buf = vec![0u8; report_length];
     let mut sequence = 0u64;
 
@@ -611,7 +650,7 @@ fn forward_auxiliary_reports(
                 ),
             );
         }
-        match hidg_write.write_all(&buf) {
+        match hidg_write.send(&buf) {
             Ok(()) if log_report => trace(
                 event_counter,
                 &format!("{name} HID sequence={sequence}: HID gadget write completed result=ok"),
@@ -705,13 +744,14 @@ fn readable_now(fd: i32) -> std::io::Result<bool> {
 
 /// Forward the physical mouse to the HID gadget, merging reports that pile up while a write is in flight.
 ///
-/// The stock f_hid gadget advertises a 10ms full-speed interval and `write()` blocks until the host has polled
-/// the previous report, so it drains at ~100 reports/s. The Deck's trackpad-mouse produces reports faster than that,
+/// An endpoint write blocks until the host has polled the previous report, so the host's polling interval
+/// (10ms with the stock f_hid gadget older versions used) caps the drain rate. The Deck's trackpad-mouse produces reports faster than that,
 /// so forwarding them 1:1 builds a backlog (hidraw buffer + f_hid queue) and the pointer lags further and further behind the finger.
 /// Mouse reports are relative deltas, so reports that arrive while we wait can be summed into one without losing any motion.
 fn forward_mouse_reports(
+    mount: &std::path::Path,
+    ep_number: usize,
     source: &HidRaw,
-    hidg_device: &std::path::Path,
     running: &AtomicBool,
     event_counter: &AtomicU64,
 ) -> std::io::Result<()> {
@@ -721,7 +761,7 @@ fn forward_mouse_reports(
         return Err(std::io::Error::last_os_error());
     }
     let mut hidraw_read = unsafe { std::fs::File::from_raw_fd(raw_fd) };
-    let mut hidg_write = std::fs::OpenOptions::new().write(true).open(hidg_device)?;
+    let mut hidg_write = EpIn::open(mount, ep_number)?;
     let fd = hidraw_read.as_raw_fd();
 
     let read_report = |file: &mut std::fs::File| -> std::io::Result<Option<[u8; LEN]>> {
@@ -789,7 +829,7 @@ fn forward_mouse_reports(
                 ),
             );
         }
-        if let Err(error) = hidg_write.write_all(&report) {
+        if let Err(error) = hidg_write.send(&report) {
             trace(
                 event_counter,
                 &format!(
@@ -806,11 +846,12 @@ fn forward_mouse_reports(
 /// Continuously read whatever the real controller sends and push it byte-for-byte out the IN endpoint to the host
 fn forward_reports(
     mount: &std::path::Path,
+    ep_number: usize,
     controller: &HidRaw,
     running: &AtomicBool,
     event_counter: &AtomicU64,
 ) -> std::io::Result<()> {
-    let mut ep_in = EpIn::open(mount)?;
+    let mut ep_in = EpIn::open(mount, ep_number)?;
     // duplicate the hidraw fd for blocking reads on this thread
     let raw_fd = unsafe { libc::dup(controller.file.as_raw_fd()) };
     if raw_fd < 0 {
@@ -902,7 +943,8 @@ fn wait_readable(fd: i32, running: &AtomicBool) -> std::io::Result<bool> {
 fn handle_setup(
     ep0: &mut Ep0,
     controller: &HidRaw,
-    report_descriptor: &[u8],
+    layout: &[InterfaceSpec],
+    protocols: &mut [u8],
     feature_trace: &mut FeatureTrace,
     event_counter: &AtomicU64,
     req: SetupRequest,
@@ -919,6 +961,30 @@ fn handle_setup(
             req.length
         ),
     );
+
+    // FunctionFS rewrites wIndex of interface-directed requests to the function-local interface number, which is the index into `layout`
+    let index = usize::from(req.index & 0x00ff);
+    let Some(iface) = layout.get(index) else {
+        ep0.stall(req.is_device_to_host())?;
+        return Ok(());
+    };
+    let report_descriptor = &iface.report_descriptor[..];
+    // Only the vendor interface talks to the real controller; mouse and keyboard have no feature reports
+    let is_vendor = iface.role == Role::Vendor;
+
+    // The HID class descriptor, rebuilt from the same values advertised in the configuration descriptor
+    if req.request == USB_GET_DESCRIPTOR
+        && req.is_device_to_host()
+        && (req.value >> 8) as u8 == USB_DT_HID
+    {
+        let descriptor = hid_descriptor(
+            report_descriptor.len() as u16,
+            iface.bcd_hid,
+            iface.country_code,
+        );
+        let length = usize::from(req.length).min(descriptor.len());
+        return ep0.respond_in(&descriptor[..length]);
+    }
 
     // HID report descriptors are requested through the *standard* USB GET_DESCRIPTOR request (descriptor type 0x22) rather than a HID class request.
     // FunctionFS delivers this setup packet to us; stalling it makes the host enumerate the USB device but decline to create an IOHID device
@@ -960,7 +1026,8 @@ fn handle_setup(
 
     match req.request {
         HID_GET_REPORT
-            if req.is_device_to_host()
+            if is_vendor
+                && req.is_device_to_host()
                 && report_type == HID_REPORT_TYPE_FEATURE
                 && req.length != 0 =>
         {
@@ -1040,7 +1107,9 @@ fn handle_setup(
         {
             ep0.stall(req.is_device_to_host())?;
         }
-        HID_SET_REPORT if !req.is_device_to_host() && report_type == HID_REPORT_TYPE_FEATURE => {
+        HID_SET_REPORT
+            if is_vendor && !req.is_device_to_host() && report_type == HID_REPORT_TYPE_FEATURE =>
+        {
             let data = ep0.read_out(req.length as usize)?;
             let sequence = feature_trace.sequence();
             let command = data.first().copied().unwrap_or_default();
@@ -1082,15 +1151,18 @@ fn handle_setup(
             ));
         }
 
-        // These requests are part of normal HID bring-up.
-        // Steam Deck controller vendor protocol has no boot-protocol distinction and does not use idle rates,
-        // so this reports zero/default values and acknowledges the setters rather than stalling the host
-        HID_GET_IDLE | HID_GET_PROTOCOL if req.is_device_to_host() && req.length != 0 => {
-            ep0.respond_in(&[0])?
+        // These requests are part of normal HID bring-up. None of the interfaces use idle rates,
+        // so idle reports zero and the setter is acknowledged rather than stalling the host.
+        // The boot-capable mouse/keyboard interfaces remember the protocol the host selects.
+        HID_GET_PROTOCOL if req.is_device_to_host() && req.length != 0 => {
+            ep0.respond_in(&[protocols[index]])?
         }
-        HID_SET_IDLE | HID_SET_PROTOCOL if !req.is_device_to_host() && req.length == 0 => {
+        HID_SET_PROTOCOL if !req.is_device_to_host() && req.length == 0 => {
+            protocols[index] = (req.value & 0x00ff) as u8;
             ep0.acknowledge()?
         }
+        HID_GET_IDLE if req.is_device_to_host() && req.length != 0 => ep0.respond_in(&[0])?,
+        HID_SET_IDLE if !req.is_device_to_host() && req.length == 0 => ep0.acknowledge()?,
         _ => {
             ep0.stall(req.is_device_to_host())?;
         }
