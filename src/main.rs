@@ -28,13 +28,19 @@ pub fn verbose_enabled() -> bool {
 
 fn usage(prog: &str) -> String {
     format!(
-        "deckontroller by coderobe\nusage: {prog} run [--pid 0xNNNN] [--verbose]\n       {prog} teardown [--verbose]\n\n\
+        "deckontroller by coderobe\nusage: {prog} run [--pid 0xNNNN] [--usage-page 0xFFNN] [--verbose]\n       {prog} teardown [--verbose]\n\n\
          run        Discover the internal controller, stand up the USB gadget,\n\
                      and relay until killed (Ctrl-C or systemd stop).\n\
          teardown   Tear down a gadget left behind by a previous run.\n\
          --pid      Pin the internal controller's USB product ID instead of\n\
                      auto-detecting by vendor usage page (0x28de:0x1205 is the\n\
                      Steam Deck's own controller; override if yours differs).\n\
+         --usage-page  Advertise this HID usage page for the vendor (controller)\n\
+                     interface to the host instead of the real one (the Deck\n\
+                     reports 0xFFFF). Must be vendor-defined, 0xFF00-0xFFFF.\n\
+                     Only the usage page label is changed; descriptor length\n\
+                     and report layout stay identical. 0xFF00 is the original\n\
+                     Steam Controller's page.\n\
          --verbose   Show configfs operations and detailed USB/HID relay traces."
     )
 }
@@ -60,7 +66,24 @@ fn main() -> ExitCode {
                 .and_then(|i| args.get(i + 1))
                 .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok());
 
-            match run(want_pid) {
+            let want_usage_page = match args.iter().position(|a| a == "--usage-page") {
+                None => None,
+                Some(i) => {
+                    let parsed = args.get(i + 1).and_then(|s| {
+                        let t = s.trim_start_matches("0x").trim_start_matches("0X");
+                        u16::from_str_radix(t, 16).ok()
+                    });
+                    match parsed {
+                        Some(v) if (0xff00..=0xffff).contains(&v) => Some(v),
+                        _ => {
+                            eprintln!("--usage-page needs a vendor-defined hex value between 0xFF00 and 0xFFFF (e.g. --usage-page 0xFF00)");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            };
+
+            match run(want_pid, want_usage_page) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("fatal: {e}");
@@ -84,7 +107,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(want_pid: Option<u16>) -> std::io::Result<()> {
+fn run(want_pid: Option<u16>, want_usage_page: Option<u16>) -> std::io::Result<()> {
     eprintln!("[deckontroller] looking for the internal controller...");
 
     let controller = hid::discover(want_pid)?;
@@ -127,7 +150,7 @@ fn run(want_pid: Option<u16>) -> std::io::Result<()> {
     let g = gadget::Gadget::create(&identity, &profile)?;
 
     // Mouse, keyboard and vendor interfaces, in the physical device's interface order
-    let layout = build_layout(&controller, &auxiliary, &profile);
+    let layout = build_layout(&controller, &auxiliary, &profile, want_usage_page);
     for (index, spec) in layout.iter().enumerate() {
         eprintln!(
             "[deckontroller] interface {index}: {:?} subclass={} protocol={} bcdHID=0x{:04x} country={} endpoint=0x{:02x} maxpacket={} interval={} string={:?}",
@@ -247,6 +270,7 @@ fn build_layout(
     controller: &hid::HidRaw,
     auxiliary: &hid::SteamDeckAuxiliaryInterfaces,
     profile: &usbdesc::PhysicalProfile,
+    usage_page: Option<u16>,
 ) -> Vec<ffs::InterfaceSpec> {
     let mut physical = vec![
         (ffs::Role::Mouse, &auxiliary.mouse.report_descriptor, profile.mouse.as_ref()),
@@ -262,6 +286,18 @@ fn build_layout(
         .enumerate()
         .map(|(position, (role, report_descriptor, iface))| {
             let mut spec = ffs::InterfaceSpec::with_defaults(role, report_descriptor.clone(), position);
+            // Optionally advertise a different vendor usage page for the controller interface. Only the copy sent to the host
+            // is modified: the physical device's descriptor (used for discovery and relaying) is left untouched
+            if role == ffs::Role::Vendor {
+                if let Some(page) = usage_page {
+                    let changed = hid::rewrite_vendor_usage_page(&mut spec.report_descriptor, page);
+                    if changed == 0 {
+                        eprintln!("[deckontroller] warning: --usage-page given but the vendor report descriptor has no vendor usage page to rewrite; descriptor left unchanged");
+                    } else {
+                        eprintln!("[deckontroller] rewrote vendor usage page to 0x{page:04x} in {changed} descriptor item(s) advertised to the host");
+                    }
+                }
+            }
             let Some(iface) = iface else { return spec };
             spec.subclass = iface.subclass;
             spec.protocol = iface.protocol;

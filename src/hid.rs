@@ -714,6 +714,50 @@ fn declares_vendor_usage_page(desc: &[u8]) -> bool {
     false
 }
 
+/// Rewrite every vendor-defined global Usage Page item (0xFF00-0xFFFF) in a HID report descriptor to `new_page`,
+/// in place, and return how many items were changed.
+///
+/// The descriptor length never changes: a vendor page needs a 2- or 4-byte item, and the new value is written
+/// into the same-sized item. Only the usage page label is touched: usages, report sizes/counts and report layout are left alone.
+/// Long items (prefix 0xFE) are skipped over by their declared length.
+pub fn rewrite_vendor_usage_page(desc: &mut [u8], new_page: u16) -> usize {
+    let mut changed = 0;
+    let mut i = 0;
+    while i < desc.len() {
+        let prefix = desc[i];
+        if prefix == 0xfe {
+            // Long item: 0xFE, data size, long tag, data...
+            let Some(&data_size) = desc.get(i + 1) else { break };
+            i += 3 + usize::from(data_size);
+            continue;
+        }
+        let size = match prefix & 0x03 {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        if i + 1 + size > desc.len() {
+            break;
+        }
+        // Usage Page: Global item, tag 0x04
+        if prefix & 0xfc == 0x04 {
+            let value: u32 = match size {
+                2 => u32::from(u16::from_le_bytes([desc[i + 1], desc[i + 2]])),
+                4 => u32::from_le_bytes([desc[i + 1], desc[i + 2], desc[i + 3], desc[i + 4]]),
+                _ => 0,
+            };
+            if (0xff00..=0xffff).contains(&value) {
+                let bytes = u32::from(new_page).to_le_bytes();
+                desc[i + 1..i + 1 + size].copy_from_slice(&bytes[..size]);
+                changed += 1;
+            }
+        }
+        i += 1 + size;
+    }
+    changed
+}
+
 /// Find the Deck's internal vendor-HID controller interface.
 ///
 /// `want_product` lets the caller pin a specific PID;
@@ -752,4 +796,32 @@ pub fn discover(want_product: Option<u16>) -> io::Result<HidRaw> {
              with Steam's own use of the controller not blocking hidraw access?)",
         )
     })
+}
+
+#[cfg(test)]
+mod usage_page_tests {
+    use super::rewrite_vendor_usage_page;
+
+    // The Steam Deck controller's vendor interface report descriptor
+    const DECK_VENDOR: [u8; 25] = [
+        0x06, 0xff, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x40,
+        0x09, 0x01, 0x81, 0x02, 0x09, 0x01, 0xb1, 0x02, 0xc0,
+    ];
+
+    #[test]
+    fn rewrites_only_the_usage_page() {
+        let mut d = DECK_VENDOR;
+        assert_eq!(rewrite_vendor_usage_page(&mut d, 0xff00), 1);
+        assert_eq!(&d[..3], &[0x06, 0x00, 0xff]);
+        assert_eq!(&d[3..], &DECK_VENDOR[3..]);
+    }
+
+    #[test]
+    fn leaves_standard_pages_alone() {
+        // Keyboard: Usage Page (Generic Desktop) = 0x01 must not be touched
+        let mut kbd = [0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0xc0];
+        let orig = kbd;
+        assert_eq!(rewrite_vendor_usage_page(&mut kbd, 0xff00), 0);
+        assert_eq!(kbd, orig);
+    }
 }
